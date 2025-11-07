@@ -1,0 +1,192 @@
+use crate::error::{DisplayableError, Error, ErrorList};
+use globset::{Glob, GlobSet, GlobSetBuilder};
+use itertools::Itertools;
+use std::ffi::os_str;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+use std::{fs, io};
+use tempfile::TempDir;
+
+#[derive(Clone, Hash, PartialEq, Eq)]
+pub struct GlobArgs {
+    target_dir: String,
+    includes: Vec<String>,
+    excludes: Vec<String>,
+    hidden: bool,
+}
+
+/// A file or directory.
+pub struct TreeEntry {
+    /// The parent dir of this entry. An index into `CompressedTree.tree`.
+    pub parent_index: usize,
+    /// The base name (last path component) of this entry. An index into `CompressedTree.strings`.
+    pub string_index: usize,
+}
+
+pub struct CompressedTree {
+    pub strings: Vec<String>,
+    pub tree: Vec<TreeEntry>,
+}
+
+impl CompressedTree {
+      fn new(root_dir: String) -> Self {
+        CompressedTree {
+            strings: vec![root_dir],
+            tree: vec![TreeEntry {
+                parent_index: 0,
+                string_index: 0,
+            }],
+        }
+    }
+
+    fn add_string(&mut self, s: String) -> usize {
+        let index = self.strings.len();
+        self.strings.push(s);
+        return index;
+    }
+
+    pub fn get_path(&self, index: usize) -> PathBuf {
+        let mut components = Vec::new();
+        let mut current_index = index;
+        while current_index != 0 {
+            let entry = &self.tree[current_index];
+            let name = &self.strings[entry.string_index];
+            components.push(name.clone());
+            current_index = entry.parent_index;
+        }
+        components.reverse();
+        let path = components.iter().collect::<PathBuf>();
+        return path;
+    }
+}
+
+impl DisplayableError for globset::Error {
+    fn display(&self) -> String {
+        format!("Glob error: {}", self)
+    }
+}
+
+enum CompiledPatterns {
+    Ok { patts: globset::GlobSet },
+    Err { errs: Vec<Error> },
+}
+
+fn compile_patterns(strs: &Vec<String>) -> CompiledPatterns {
+    let strs_to_patts = |patts: &Vec<String>| {
+        patts
+            .iter()
+            .map(|pattern_str| {
+                Glob::new(pattern_str).map_err(|e| Error {
+                    message: format!("Invalid glob pattern: {}", pattern_str),
+                    inner: Some(Box::new(e)),
+                })
+            })
+            .partition_map(|res| match res {
+                Ok(pat) => itertools::Either::Left(pat),
+                Err(err) => itertools::Either::Right(err),
+            })
+    };
+    let (patts, errs): (Vec<_>, Vec<_>) = strs_to_patts(&strs);
+    if errs.len() != 0 {
+        return CompiledPatterns::Err { errs };
+    }
+    let mut builder = GlobSetBuilder::new();
+    for patt in patts.into_iter() {
+        builder.add(patt);
+    }
+    return CompiledPatterns::Ok {
+        patts: builder.build().unwrap(),
+    };
+}
+
+/// Add a path to the compressed tree.
+/// - `parent_index`: The `CompressedTree::tree` index of the parent dir of this path.
+/// - `base_name`: The base name (last path component) of this path.
+/// - `compressed_tree`: The compressed tree to add to.
+fn add_to_compressed_tree(parent_index: usize, base_name: &str, compressed_tree: &mut CompressedTree) -> usize {
+    let string_index = compressed_tree.add_string(base_name.to_string());
+    compressed_tree.tree.push(TreeEntry {
+        parent_index,
+        string_index,
+    });
+    return compressed_tree.tree.len() - 1;
+}
+
+/// Add files and directories from a directory recursively to the compressed tree.
+/// - `dir_path`: The path of the directory to glob.
+/// - `dir_index`: The `CompressedTree::tree` index of `dir_path` in the compressed tree.
+/// - `inc_patts`: The inclusion patterns.
+/// - `exc_patts`: The exclusion patterns.
+/// - `result`: The compressed tree to add to.
+fn glob_dir_recursive(
+    dir_path: &Path,
+    dir_index: usize,
+    inc_patts: &GlobSet,
+    exc_patts: &GlobSet,
+    result: &mut CompressedTree,
+) {
+    let entries = match fs::read_dir(dir_path) {
+        Ok(entries) => entries,
+        Err(e) => {
+            return;
+        }
+    };
+    for entry in entries {
+        let entry = match entry {
+            Ok(e) => e,
+            Err(e) => {
+                continue;
+            }
+        };
+        let path = entry.path();
+        let base_name = match path.iter().last() {
+            Some(os_str) => os_str,
+            None => continue, // a 0-length component like 'a/b//c' ??
+        };
+        let base_name = base_name.to_string_lossy();
+        let base_name = base_name.as_ref();
+        if path.is_symlink() {
+            continue; // skip symlinks to avoid cycles
+        }
+        // the recursive case: glob sub dirs
+        if path.is_dir() {
+            let dir_index = add_to_compressed_tree(dir_index, &base_name, result);
+            glob_dir_recursive(&path, dir_index, inc_patts, exc_patts, result);
+        } else if path.is_file() && inc_patts.is_match(&path) && !exc_patts.is_match(&path) {
+            add_to_compressed_tree(dir_index, &base_name, result);
+        }
+    }
+}
+
+pub fn glob(args: &GlobArgs) -> Result<CompressedTree, Error> {
+    let inc_patts_res = compile_patterns(&args.includes);
+    let exc_patts_res = compile_patterns(&args.excludes);
+    let (inc_patts, exc_patts) = match (inc_patts_res, exc_patts_res) {
+        (CompiledPatterns::Err { errs: errs1 }, CompiledPatterns::Err { errs: errs2 }) => {
+            let mut all_errs = errs1;
+            all_errs.extend(errs2);
+            return Err(Error::new_list(
+                "Cannot compile patterns".to_string(),
+                all_errs,
+            ));
+        }
+        (CompiledPatterns::Err { errs: errs }, _) | (_, CompiledPatterns::Err { errs: errs }) => {
+            return Err(Error::new_list("Cannot compile patterns".to_string(), errs));
+        }
+        (CompiledPatterns::Ok { patts: inc_patts }, CompiledPatterns::Ok { patts: exc_patts }) => {
+            (inc_patts, exc_patts)
+        }
+    };
+    let mut compressed_tree = CompressedTree::new(args.target_dir.clone());
+    glob_dir_recursive(
+        args.target_dir.as_ref(),
+        0,
+        &inc_patts,
+        &exc_patts,
+        &mut compressed_tree,
+    );
+    return Ok(compressed_tree);
+}
+
+#[cfg(test)]
+mod tests {}
