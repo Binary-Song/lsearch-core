@@ -12,7 +12,7 @@ use tokio::{fs::File, io::AsyncReadExt};
 
 pub use crate::core::glob::GlobProgress;
 use crate::core::io::write_index_result;
-use crate::core::task::{map_yield, Yield};
+use crate::core::task::{  Yield};
 
 use super::error::Error;
 use super::glob::{glob, CompressedTree, GlobArgs};

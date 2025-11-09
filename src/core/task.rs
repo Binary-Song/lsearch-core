@@ -22,11 +22,11 @@ pub enum TaskUpdate<TFinal, TYield> {
 }
 
 #[derive(Debug)]
-pub struct Yielder<TYield> {
+pub struct MpscYielder<TYield> {
     sender: tokio::sync::mpsc::Sender<TYield>,
 }
 
-impl<TYield> Yielder<TYield> {
+impl<TYield> MpscYielder<TYield> {
     pub async fn yield_with(&self, progress: TYield) -> Result<(), Error> {
         self.sender
             .send(progress)
@@ -39,8 +39,36 @@ impl<TYield> Yielder<TYield> {
 
 pub trait Yield<T> {
     async fn yield_with(&self, progress: T) -> Result<(), Error>;
+
+    fn map<'a, T2>(&'a self, map: Box<dyn Fn(T2) -> T>) -> MapYield<'a, T, T2, Self> {
+        MapYield {
+            inner: self,
+            map: map,
+        }
+    }
 }
- 
+
+pub trait YieldDynCompat<T> {
+    fn yield_with(&self, progress: T) -> Pin<Box<dyn Future<Output = Result<(), ()>> + Send + '_>>;
+}
+
+pub struct MapYield<'y1, T1, T2, Y1>
+where
+    Y1: Yield<T1> + ?Sized,
+{
+    inner: &'y1 Y1,
+    map: Box<dyn Fn(T2) -> T1>,
+}
+
+impl<'y1, T1, T2, Y1> Yield<T2> for MapYield<'y1, T1, T2, Y1>
+where
+    Y1: Yield<T1>,
+{
+    async fn yield_with(&self, progress: T2) -> Result<(), Error> {
+        let mapped = (self.map)(progress);
+        self.inner.yield_with(mapped).await
+    }
+}
 
 /// Spawns a task that can report progress via yields.
 ///
@@ -54,7 +82,7 @@ pub trait Yield<T> {
 ///   - An async stream of `TaskUpdate<TFinal, TYield>` that yields progress updates and finally the result or error. Implements `tokio_stream::Stream`.
 ///   - An `AbortHandle` that can be used to abort the task.
 fn spawn_task<TFinal, TYield, TFuture>(
-    task_generator: impl FnOnce(MpscYielder<TYield>) -> TFuture,
+    task_generator: impl FnOnce(Box<dyn Yield<TYield>>) -> TFuture,
     channel_buffer: usize,
 ) -> (impl Stream<Item = TaskUpdate<TFinal, TYield>>, AbortHandle)
 where
