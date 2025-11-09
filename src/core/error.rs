@@ -26,9 +26,10 @@ pub enum Error {
     CannotWrite {
         inner_err: io::Error,
     },
-    TaskPanicked {
+    TaskDiedWithJoinError {
         inner: JoinError,
     },
+    TaskClosedTheChannel,
     SerdeJsonFailed {
         inner: serde_json::Error,
     },
@@ -64,7 +65,7 @@ impl Display for Error {
             } => {
                 write!(f, "Cannot read file {}: {}", file_index, inner_err)?;
             }
-            Error::TaskPanicked { inner } => {
+            Error::TaskDiedWithJoinError { inner } => {
                 write!(f, "Task panicked: {}", inner)?;
             }
             Error::SerdeJsonFailed { inner } => {
@@ -72,6 +73,8 @@ impl Display for Error {
             }
             Error::CannotWrite { inner_err } => write!(f, "Cannot write to file: {}", inner_err)?,
             Error::LogicalError { message } => write!(f, "Logical error: {}", message)?,
+            Error::TaskClosedTheChannel => write!(f, "Task closed the channel unexpectedly")?,
+            Error::YieldError { message } => write!(f, "Yield error: {}", message)?,
         }
         Ok(())
     }
