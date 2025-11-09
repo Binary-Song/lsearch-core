@@ -1,21 +1,27 @@
-use crate::error::{DisplayableError, Error, ErrorList};
+use super::error::Error;
 use globset::{Glob, GlobSet, GlobSetBuilder};
 use itertools::Itertools;
 use std::ffi::os_str;
+use std::fmt::Display;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::{fs, io};
 use tempfile::TempDir;
 
-#[derive(Clone, Hash, PartialEq, Eq)]
+#[derive(Clone)]
 pub struct GlobArgs {
-    target_dir: String,
-    includes: Vec<String>,
-    excludes: Vec<String>,
-    hidden: bool,
+    pub target_dir: String,
+    pub includes: Vec<String>,
+    pub excludes: Vec<String>,
+    pub report_glob_progress_interval: usize,
+    pub report_glob_progress_channel: tokio::sync::mpsc::Sender<GlobProgress>,
 }
 
+pub enum GlobProgress {
+    GlobUpdated { total_entries: usize },
+}
 /// A file or directory.
+#[derive(Debug)]
 pub struct TreeEntry {
     /// The parent dir of this entry. An index into `CompressedTree.tree`.
     pub parent_index: usize,
@@ -23,13 +29,14 @@ pub struct TreeEntry {
     pub string_index: usize,
 }
 
+#[derive(Debug)]
 pub struct CompressedTree {
     pub strings: Vec<String>,
     pub tree: Vec<TreeEntry>,
 }
 
 impl CompressedTree {
-      fn new(root_dir: String) -> Self {
+    fn new(root_dir: String) -> Self {
         CompressedTree {
             strings: vec![root_dir],
             tree: vec![TreeEntry {
@@ -60,12 +67,6 @@ impl CompressedTree {
     }
 }
 
-impl DisplayableError for globset::Error {
-    fn display(&self) -> String {
-        format!("Glob error: {}", self)
-    }
-}
-
 enum CompiledPatterns {
     Ok { patts: globset::GlobSet },
     Err { errs: Vec<Error> },
@@ -76,9 +77,9 @@ fn compile_patterns(strs: &Vec<String>) -> CompiledPatterns {
         patts
             .iter()
             .map(|pattern_str| {
-                Glob::new(pattern_str).map_err(|e| Error {
-                    message: format!("Invalid glob pattern: {}", pattern_str),
-                    inner: Some(Box::new(e)),
+                Glob::new(pattern_str).map_err(|e| Error::InvalidPattern {
+                    pattern: pattern_str.clone(),
+                    inner: e,
                 })
             })
             .partition_map(|res| match res {
@@ -103,7 +104,12 @@ fn compile_patterns(strs: &Vec<String>) -> CompiledPatterns {
 /// - `parent_index`: The `CompressedTree::tree` index of the parent dir of this path.
 /// - `base_name`: The base name (last path component) of this path.
 /// - `compressed_tree`: The compressed tree to add to.
-fn add_to_compressed_tree(parent_index: usize, base_name: &str, compressed_tree: &mut CompressedTree) -> usize {
+/// - return: The `CompressedTree::tree` index of the newly added path.
+fn add_to_compressed_tree(
+    parent_index: usize,
+    base_name: &str,
+    compressed_tree: &mut CompressedTree,
+) -> usize {
     let string_index = compressed_tree.add_string(base_name.to_string());
     compressed_tree.tree.push(TreeEntry {
         parent_index,
@@ -118,11 +124,18 @@ fn add_to_compressed_tree(parent_index: usize, base_name: &str, compressed_tree:
 /// - `inc_patts`: The inclusion patterns.
 /// - `exc_patts`: The exclusion patterns.
 /// - `result`: The compressed tree to add to.
-fn glob_dir_recursive(
+///
+/// - `report_progress_interval`: The interval at which to report progress.
+/// - `current_count`: The current count of processed entries.
+/// - `progress_report_channel`: The channel to report progress on.
+async fn glob_dir_recursive(
     dir_path: &Path,
     dir_index: usize,
     inc_patts: &GlobSet,
     exc_patts: &GlobSet,
+    report_progress_interval: usize,
+    report_counter: &mut usize,
+    report_progress_channel: &mut tokio::sync::mpsc::Sender<GlobProgress>,
     result: &mut CompressedTree,
 ) {
     let entries = match fs::read_dir(dir_path) {
@@ -151,27 +164,41 @@ fn glob_dir_recursive(
         // the recursive case: glob sub dirs
         if path.is_dir() {
             let dir_index = add_to_compressed_tree(dir_index, &base_name, result);
-            glob_dir_recursive(&path, dir_index, inc_patts, exc_patts, result);
+            glob_dir_recursive(
+                &path,
+                dir_index,
+                inc_patts,
+                exc_patts,
+                report_progress_interval,
+                report_counter,
+                report_progress_channel,
+                result,
+            );
         } else if path.is_file() && inc_patts.is_match(&path) && !exc_patts.is_match(&path) {
             add_to_compressed_tree(dir_index, &base_name, result);
+            *report_counter += 1;
+            if *report_counter % report_progress_interval == 0 {
+                report_progress_channel
+                    .send(GlobProgress::GlobUpdated {
+                        total_entries: *report_counter,
+                    })
+                    .await;
+            }
         }
     }
 }
 
-pub fn glob(args: &GlobArgs) -> Result<CompressedTree, Error> {
+pub async fn glob(args:  GlobArgs) -> Result<CompressedTree, Error> {
     let inc_patts_res = compile_patterns(&args.includes);
     let exc_patts_res = compile_patterns(&args.excludes);
     let (inc_patts, exc_patts) = match (inc_patts_res, exc_patts_res) {
         (CompiledPatterns::Err { errs: errs1 }, CompiledPatterns::Err { errs: errs2 }) => {
-            let mut all_errs = errs1;
-            all_errs.extend(errs2);
-            return Err(Error::new_list(
-                "Cannot compile patterns".to_string(),
-                all_errs,
-            ));
+            let mut errs = errs1;
+            errs.extend(errs2);
+            return Err(Error::InvalidPatterns { errs });
         }
-        (CompiledPatterns::Err { errs: errs }, _) | (_, CompiledPatterns::Err { errs: errs }) => {
-            return Err(Error::new_list("Cannot compile patterns".to_string(), errs));
+        (CompiledPatterns::Err { errs }, _) | (_, CompiledPatterns::Err { errs }) => {
+            return Err(Error::InvalidPatterns { errs });
         }
         (CompiledPatterns::Ok { patts: inc_patts }, CompiledPatterns::Ok { patts: exc_patts }) => {
             (inc_patts, exc_patts)
@@ -183,8 +210,12 @@ pub fn glob(args: &GlobArgs) -> Result<CompressedTree, Error> {
         0,
         &inc_patts,
         &exc_patts,
+        args.report_glob_progress_interval,
+        &mut 0,
+        &mut args.report_glob_progress_channel.clone(),
         &mut compressed_tree,
-    );
+    )
+    .await;
     return Ok(compressed_tree);
 }
 
