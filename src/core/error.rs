@@ -33,7 +33,10 @@ pub enum Error {
     SerdeJsonFailed {
         inner: serde_json::Error,
     },
-    YieldError {
+    SendError {
+        message: String,
+    },
+    RecvError {
         message: String,
     },
     LogicalError {
@@ -74,7 +77,7 @@ impl Display for Error {
             Error::CannotWrite { inner_err } => write!(f, "Cannot write to file: {}", inner_err)?,
             Error::LogicalError { message } => write!(f, "Logical error: {}", message)?,
             Error::TaskClosedTheChannel => write!(f, "Task closed the channel unexpectedly")?,
-            Error::YieldError { message } => write!(f, "Yield error: {}", message)?,
+            Error::SendError { message } => write!(f, "Yield error: {}", message)?,
         }
         Ok(())
     }

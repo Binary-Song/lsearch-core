@@ -10,6 +10,7 @@ use std::pin::Pin;
 use std::process::Output;
 use std::task::Context;
 use std::task::Poll;
+use tokio::sync::mpsc::error::TryRecvError;
 use tokio::task::AbortHandle;
 use tokio_stream::Stream;
 use tokio_stream::StreamExt;
@@ -22,51 +23,46 @@ pub enum TaskUpdate<TFinal, TYield> {
 }
 
 #[derive(Debug)]
-pub struct MpscYielder<TYield> {
-    sender: tokio::sync::mpsc::Sender<TYield>,
+pub struct Channel<S> {
+    sender: tokio::sync::mpsc::Sender<S>,
 }
 
-impl<TYield> MpscYielder<TYield> {
-    pub async fn yield_with(&self, progress: TYield) -> Result<(), Error> {
+impl<T> Channel<T> {
+    pub async fn send(&self, progress: T) -> Result<(), Error> {
         self.sender
             .send(progress)
             .await
-            .map_err(|e| Error::YieldError {
-                message: format!("Failed to send yield progress: {}", e),
+            .map_err(|e| Error::SendError {
+                message: format!("Failed to send: {}", e),
             })
     }
 }
 
-pub trait Yield<T> {
-    async fn yield_with(&self, progress: T) -> Result<(), Error>;
+struct Task<S, TFinal, TYield>
+where
+    S: Stream<Item = TaskUpdate<TFinal, TYield>>,
+{
+    stream: Pin<Box<S>>,
+    abort_handle: AbortHandle,
+}
 
-    fn map<'a, T2>(&'a self, map: Box<dyn Fn(T2) -> T>) -> MapYield<'a, T, T2, Self> {
-        MapYield {
-            inner: self,
-            map: map,
-        }
+impl<S, TFinal, TYield> Drop for Task<S, TFinal, TYield>
+where
+    S: Stream<Item = TaskUpdate<TFinal, TYield>>,
+{
+    fn drop(&mut self) {
+        self.abort_handle.abort();
     }
 }
 
-pub trait YieldDynCompat<T> {
-    fn yield_with(&self, progress: T) -> Pin<Box<dyn Future<Output = Result<(), ()>> + Send + '_>>;
-}
-
-pub struct MapYield<'y1, T1, T2, Y1>
+impl<S, TFinal, TYield> Stream for Task<S, TFinal, TYield>
 where
-    Y1: Yield<T1> + ?Sized,
+    S: Stream<Item = TaskUpdate<TFinal, TYield>>,
 {
-    inner: &'y1 Y1,
-    map: Box<dyn Fn(T2) -> T1>,
-}
+    type Item = TaskUpdate<TFinal, TYield>;
 
-impl<'y1, T1, T2, Y1> Yield<T2> for MapYield<'y1, T1, T2, Y1>
-where
-    Y1: Yield<T1>,
-{
-    async fn yield_with(&self, progress: T2) -> Result<(), Error> {
-        let mapped = (self.map)(progress);
-        self.inner.yield_with(mapped).await
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        self.stream.as_mut().poll_next(cx)
     }
 }
 
@@ -81,17 +77,17 @@ where
 /// - return value: A tuple of:
 ///   - An async stream of `TaskUpdate<TFinal, TYield>` that yields progress updates and finally the result or error. Implements `tokio_stream::Stream`.
 ///   - An `AbortHandle` that can be used to abort the task.
-fn spawn_task<TFinal, TYield, TFuture>(
-    task_generator: impl FnOnce(Box<dyn Yield<TYield>>) -> TFuture,
+pub fn spawn_task<TFinal, TYield, TFuture>(
+    task_generator: impl FnOnce(Channel<TYield>) -> TFuture,
     channel_buffer: usize,
-) -> (impl Stream<Item = TaskUpdate<TFinal, TYield>>, AbortHandle)
+) -> impl Stream<Item = TaskUpdate<TFinal, TYield>> + Drop
 where
     TFinal: Send + Unpin + 'static,
     TYield: Send + Unpin + 'static,
     TFuture: Future<Output = TFinal> + Send + 'static,
 {
     let (sender, mut recvr) = tokio::sync::mpsc::channel::<TYield>(channel_buffer);
-    let yielder = MpscYielder { sender };
+    let yielder = Channel { sender };
     let future = task_generator(yielder);
     let join_fut = tokio::spawn(future);
     let abort_handle = join_fut.abort_handle();
@@ -130,5 +126,8 @@ where
             }
         };
     };
-    return (strm, abort_handle);
+    Task {
+        stream: Box::pin(strm),
+        abort_handle,
+    }
 }
