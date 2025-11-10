@@ -2,7 +2,7 @@ use super::error::Error;
 use super::glob::{glob, CompressedTree, GlobArgs};
 pub use crate::core::glob::GlobProgress;
 use crate::core::io::write_index_result;
-use crate::core::task::{spawn_task, TaskUpdate, Channel};
+use crate::core::task::{spawn_task, AutoAbortHandle, Channel, TaskUpdate};
 use futures::{pin_mut, AsyncWriteExt};
 use std::collections::HashMap;
 use std::future::Future;
@@ -187,8 +187,8 @@ pub enum IndexDirProgress {
 
 pub async fn index_directory(
     args: IndexArgs,
-    yielder: &Channel<IndexDirProgress>,
-) -> Result<impl Future<Output = ()>, Error> {
+    yielder: Channel<IndexDirProgress>,
+) -> Result<(), Error> {
     let args1 = args.clone();
     // ----------------------------
     // Glob
@@ -200,21 +200,18 @@ pub async fn index_directory(
         excludes: args1.excludes,
         report_glob_progress_interval: args1.report_glob_progress_interval,
     };
-    let (glob_stream, handle) = spawn_task(
+    let glob_task = spawn_task(
         |y| async move { glob(&glob_args, &y).await },
         args1.channel_capacity,
     );
-    pin_mut!(glob_stream);
-
+    pin_mut!(glob_task);
     let glob_result = loop {
         // Future<Output = Option<TaskUpdate<Result<CompressedTree, Error>
-        let next = glob_stream.next();
+        let next = glob_task.next();
         let opt = next.await;
         match opt {
             Some(TaskUpdate::Yield(y)) => {
-                yielder
-                    .send(IndexDirProgress::GlobProgress(y))
-                    .await?;
+                yielder.send(IndexDirProgress::GlobProgress(y)).await?;
                 continue;
             }
             Some(TaskUpdate::Final(Ok(tree))) => {
@@ -242,7 +239,7 @@ pub async fn index_directory(
     let glob = Arc::new(glob_result);
     let args: Arc<IndexArgs> = Arc::new(args);
     // create a bunch of tasks
-    let employee_tasks = glob.tree.iter().enumerate().map(|(file_index, _entry)| {
+    let worker_tasks = glob.tree.iter().enumerate().map(|(file_index, _entry)| {
         // below are member variables moved into async block
         let file_index = file_index;
         let glob = glob.clone();
@@ -251,10 +248,12 @@ pub async fn index_directory(
     });
     let mut set = JoinSet::new();
     let mut abort_handles = Vec::new();
-    for task in employee_tasks {
-        abort_handles.push(set.spawn(task));
+    for task in worker_tasks {
+        let h = AutoAbortHandle::new(set.spawn(task));
+        abort_handles.push(h);
     }
-    // The boss collects results from the employees,
+
+    // The boss collects results from the workers,
     // merges them into a final result,
     // and reports progress
     let boss_task = async move {
@@ -268,7 +267,8 @@ pub async fn index_directory(
         let mut final_res = GramToOffsets::new();
         let mut indexed = 0;
         let total = glob.tree.len();
-        // loop until all tasks are done
+        // keep awaiting for worker results
+        // loop until all worker tasks are done
         while let Some(res) = set.join_next().await {
             indexed += 1;
             match res {
@@ -295,9 +295,7 @@ pub async fn index_directory(
             };
         }
         // write index to file
-        yielder
-            .send(IndexDirProgress::WriteIndexStarted)
-            .await?;
+        yielder.send(IndexDirProgress::WriteIndexStarted).await?;
         let tree = Arc::try_unwrap(glob).map_err(|e| Error::LogicalError {
                     message: "Unable to unwrap the globbed result. This should not happen because all tasks referencing it should be done at this point."
                         .to_string(),
@@ -313,14 +311,12 @@ pub async fn index_directory(
         yielder.send(IndexDirProgress::WriteIndexDone).await?;
         Ok::<(), Error>(())
     };
-    abort_handles.push(tokio::spawn(boss_task).abort_handle());
+    let h = tokio::spawn(boss_task);
+    abort_handles.push(AutoAbortHandle::new(h.abort_handle()));
     abort_handles.shrink_to_fit();
-    let aborter = async move {
-        for handle in abort_handles {
-            handle.abort();
-        }
-    };
-    return Ok(aborter);
+    h.await
+        .map_err(|e| Error::TaskDiedWithJoinError { inner: e })??;
+    return Ok(());
 }
 
 // pub async fn index_directory(args: IndexArgs) {

@@ -65,6 +65,21 @@ where
         self.stream.as_mut().poll_next(cx)
     }
 }
+pub struct AutoAbortHandle {
+    abort_handle: AbortHandle,
+}
+
+impl AutoAbortHandle {
+    pub fn new(abort_handle: AbortHandle) -> Self {
+        AutoAbortHandle { abort_handle }
+    }
+}
+
+impl Drop for AutoAbortHandle {
+    fn drop(&mut self) {
+        self.abort_handle.abort();
+    }
+}
 
 /// Spawns a task that can report progress via yields.
 ///

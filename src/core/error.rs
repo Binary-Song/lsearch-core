@@ -77,7 +77,8 @@ impl Display for Error {
             Error::CannotWrite { inner_err } => write!(f, "Cannot write to file: {}", inner_err)?,
             Error::LogicalError { message } => write!(f, "Logical error: {}", message)?,
             Error::TaskClosedTheChannel => write!(f, "Task closed the channel unexpectedly")?,
-            Error::SendError { message } => write!(f, "Yield error: {}", message)?,
+            Error::SendError { message } => write!(f, "Send error: {}", message)?,
+            Error::RecvError { message } => write!(f, "Receive error: {}", message)?,
         }
         Ok(())
     }
