@@ -1,7 +1,6 @@
 use std::{
     fmt::{Debug, Display},
     io,
-    path::PathBuf,
 };
 
 use tokio::task::JoinError;
@@ -20,7 +19,6 @@ pub enum Error {
         inner_err: io::Error,
     },
     CannotRead {
-        file_index: usize,
         inner_err: io::Error,
     },
     CannotWrite {
@@ -30,7 +28,7 @@ pub enum Error {
         inner: JoinError,
     },
     TaskClosedTheChannel,
-    SerdeJsonFailed {
+    JsonError {
         inner: serde_json::Error,
     },
     SendError {
@@ -42,6 +40,7 @@ pub enum Error {
     LogicalError {
         message: String,
     },
+    BadRequest,
 }
 
 impl Display for Error {
@@ -60,18 +59,15 @@ impl Display for Error {
                 file_index,
                 inner_err,
             } => {
-                write!(f, "Cannot open file {}: {}", file_index, inner_err)?;
+                write!(f, "Cannot open file {}", inner_err)?;
             }
-            Error::CannotRead {
-                file_index,
-                inner_err,
-            } => {
-                write!(f, "Cannot read file {}: {}", file_index, inner_err)?;
+            Error::CannotRead { inner_err } => {
+                write!(f, "Cannot read file {}", inner_err)?;
             }
             Error::TaskDiedWithJoinError { inner } => {
                 write!(f, "Task panicked: {}", inner)?;
             }
-            Error::SerdeJsonFailed { inner } => {
+            Error::JsonError { inner } => {
                 write!(f, "Serde JSON failed: {}", inner)?;
             }
             Error::CannotWrite { inner_err } => write!(f, "Cannot write to file: {}", inner_err)?,
@@ -79,6 +75,7 @@ impl Display for Error {
             Error::TaskClosedTheChannel => write!(f, "Task closed the channel unexpectedly")?,
             Error::SendError { message } => write!(f, "Send error: {}", message)?,
             Error::RecvError { message } => write!(f, "Receive error: {}", message)?,
+            Error::BadRequest => write!(f, "Bad Request",)?,
         }
         Ok(())
     }

@@ -93,7 +93,7 @@ pub async fn write_index_result(
 ) -> Result<(), Error> {
     let io_index_result: IOIndexResult = index_result.into();
     let bytes = serde_json::to_vec(&io_index_result).map_err(|e| {
-        return Error::SerdeJsonFailed { inner: e };
+        return Error::JsonError { inner: e };
     })?;
     out.write_all(&bytes).await.map_err(|e| {
         return Error::CannotWrite { inner_err: e };

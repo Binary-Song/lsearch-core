@@ -1,32 +1,138 @@
 mod core;
-mod interface;
 
+use crate::core::Error;
+use core::index_directory;
+use core::IndexArgs;
+use serde::Deserialize;
+use serde::Serialize;
 use serde_json::Value;
+use std::io::{BufRead, BufReader};
+use std::pin::Pin;
 use std::process::ExitCode;
-use std::{
-    fs::read,
-    io::{BufRead, BufReader},
-};
+use tokio::io::AsyncWriteExt;
+use tokio::io::Stdout;
 
-#[tokio::main]
-async fn main() -> ExitCode {
+#[derive(Deserialize)]
+#[serde(tag = "request_type", content = "request_data")]
+enum Request {
+    IndexDirectory(IndexRequest),
+}
+
+#[derive(Serialize)]
+#[serde(tag = "response_type", content = "response_data")]
+enum Response {
+    IndexResponse(IndexResponse),
+    Error { message: String },
+}
+
+#[derive(Deserialize)]
+struct IndexRequest {
+    target_dir: String,
+    includes: Vec<String>,
+    excludes: Vec<String>,
+    read_chunk_size: usize,
+    gram_size: usize,
+    channel_capacity: usize,
+    output_path: String,
+}
+
+#[derive(Serialize)]
+#[serde(tag = "type", content = "data")]
+enum IndexResponse {
+    GlobUpdated {
+        entries: usize,
+    },
+    IndexAdded {
+        finished_entries: usize,
+        total_entries: usize,
+    },
+    Writing,
+    Finished,
+}
+
+async fn handle_index_directory_request(
+    args: IndexRequest,
+    mut out: Pin<&mut impl tokio::io::AsyncWrite>,
+) -> Result<(), Error> {
+    let args = IndexArgs {
+        target_dir: args.target_dir,
+        includes: args.includes,
+        excludes: args.excludes,
+        read_chunk_size: args.read_chunk_size,
+        gram_size: args.gram_size,
+        channel_capacity: args.channel_capacity,
+        output_path: args.output_path,
+    };
+    let (send, mut recv) = tokio::sync::mpsc::channel(args.channel_capacity);
+    while let Some(event) = recv.recv().await {
+        let resp = match event {
+            core::Progress::GlobUpdated { entries } => IndexResponse::GlobUpdated { entries },
+            core::Progress::IndexAdded {
+                finished_entries,
+                total_entries,
+            } => IndexResponse::IndexAdded {
+                finished_entries,
+                total_entries,
+            },
+            core::Progress::Writing => IndexResponse::Writing,
+        };
+        let v = serde_json::to_value(resp).map_err(|e| Error::JsonError { inner: e })?;
+        let line = serde_json::to_string(&v).map_err(|e| Error::JsonError { inner: e })? + "\n";
+        out.as_mut()
+            .write_all(line.as_bytes())
+            .await
+            .map_err(|e| Error::CannotWrite { inner_err: e })?;
+    }
+
+    match index_directory(args, send).await {
+        Ok(_) => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
+async fn handle_msg(msg: Value, out: Pin<&mut impl tokio::io::AsyncWrite>) -> Result<(), Error> {
+    let msg: Request = serde_json::from_value(msg).map_err(|e| Error::JsonError { inner: e })?;
+    match msg {
+        Request::IndexDirectory(args) => handle_index_directory_request(args, out).await,
+    }
+}
+
+async fn main_loop(mut out: Pin<&mut impl tokio::io::AsyncWrite>) -> Result<(), Error> {
     let stdin = std::io::stdin();
-    let stdout = std::io::stdout();
-    let mut stdout = stdout.lock();
     let reader = BufReader::new(stdin);
     for line in reader.lines() {
         let line = match line {
             Ok(l) => l,
-            Err(_) => {
-                return ExitCode::FAILURE;
+            Err(e) => {
+                return Err(Error::CannotRead { inner_err: e });
             }
         };
-
-        let msg: Value = match serde_json::from_str(&line) {
+        let serde_value = match serde_json::from_str::<Value>(&line) {
             Ok(v) => v,
-            Err(_) => continue,
+            Err(e) => {
+                return Err(Error::JsonError { inner: e });
+            }
         };
+        handle_msg(serde_value, out.as_mut()).await?;
     }
+    return Ok(());
+}
 
-    todo!()
+#[tokio::main]
+async fn main() -> ExitCode {
+    let stdout = tokio::io::stdout();
+    let mut stdout = Box::pin(stdout);
+    let result = main_loop(stdout.as_mut()).await;
+    match result {
+        Ok(_) => ExitCode::SUCCESS,
+        Err(e) => {
+            let s = serde_json::to_string(&Response::Error {
+                message: format!("{}", e),
+            })
+            .unwrap();
+            let b = s.as_bytes();
+            stdout.as_mut().write_all(b).await.ok();
+            ExitCode::FAILURE
+        }
+    }
 }

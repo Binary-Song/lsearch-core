@@ -1,8 +1,7 @@
 use super::error::Error;
 use super::glob::{glob, CompressedTree, GlobArgs};
-pub use crate::core::glob::GlobProgress;
 use crate::core::io::write_index_result;
-use crate::core::task::{spawn_task, AutoAbortHandle, Channel, TaskUpdate};
+use crate::core::progress::Progress;
 use futures::{pin_mut, AsyncWriteExt};
 use std::collections::HashMap;
 use std::future::Future;
@@ -17,7 +16,6 @@ pub struct IndexArgs {
     pub target_dir: String,
     pub includes: Vec<String>,
     pub excludes: Vec<String>,
-    pub report_glob_progress_interval: usize,
     pub read_chunk_size: usize,
     pub gram_size: usize,
     pub channel_capacity: usize,
@@ -125,7 +123,6 @@ async fn index_file(
             file.read(&mut chunk[padding_size..])
                 .await
                 .map_err(|e| Error::CannotRead {
-                    file_index: file_index,
                     inner_err: e,
                 })?;
 
@@ -174,69 +171,34 @@ pub enum BuildIndexProgress {
     UpdatedErr(Error),
 }
 
-pub enum IndexDirProgress {
-    GlobStarted,
-    GlobProgress(GlobProgress),
-    GlobDone,
-    BuildIndexStarted,
-    BuildIndexProgress(BuildIndexProgress),
-    BuildIndexDone,
-    WriteIndexStarted,
-    WriteIndexDone,
-}
-
 pub async fn index_directory(
     args: IndexArgs,
-    yielder: Channel<IndexDirProgress>,
+    yielder: tokio::sync::mpsc::Sender<Progress>,
 ) -> Result<(), Error> {
+    // ----------------------------
+    // Prepare
+    // ----------------------------
+    // open the output, aka the index file
+    let mut output_file = tokio::fs::File::create(Path::new(&args.output_path))
+        .await
+        .map_err(|e| {
+            return Error::CannotWrite { inner_err: e };
+        })?;
+
     let args1 = args.clone();
     // ----------------------------
     // Glob
     // ----------------------------
-    yielder.send(IndexDirProgress::GlobStarted).await?;
     let glob_args = GlobArgs {
         target_dir: args1.target_dir,
         includes: args1.includes,
         excludes: args1.excludes,
-        report_glob_progress_interval: args1.report_glob_progress_interval,
     };
-    let glob_task = spawn_task(
-        |y| async move { glob(&glob_args, &y).await },
-        args1.channel_capacity,
-    );
-    pin_mut!(glob_task);
-    let glob_result = loop {
-        // Future<Output = Option<TaskUpdate<Result<CompressedTree, Error>
-        let next = glob_task.next();
-        let opt = next.await;
-        match opt {
-            Some(TaskUpdate::Yield(y)) => {
-                yielder.send(IndexDirProgress::GlobProgress(y)).await?;
-                continue;
-            }
-            Some(TaskUpdate::Final(Ok(tree))) => {
-                break tree;
-            }
-            Some(TaskUpdate::Final(Err(e))) => {
-                return Err(e);
-            }
-            Some(TaskUpdate::Error(e)) => {
-                return Err(e);
-            }
-            None => {
-                return Err(Error::LogicalError {
-                    message: "Stream::next returned None".to_string(),
-                });
-            }
-        }
-    };
-
-    yielder.send(IndexDirProgress::GlobDone).await?;
-
+    let compressed_tree = glob(&glob_args, yielder.clone()).await?;
     // ----------------------------
     // Index
     // ----------------------------
-    let glob = Arc::new(glob_result);
+    let glob = Arc::new(compressed_tree);
     let args: Arc<IndexArgs> = Arc::new(args);
     // create a bunch of tasks
     let worker_tasks = glob.tree.iter().enumerate().map(|(file_index, _entry)| {
@@ -246,99 +208,54 @@ pub async fn index_directory(
         let args = args.clone();
         async move { index_file(glob.as_ref(), args.as_ref(), file_index).await }
     });
-    let mut set = JoinSet::new();
-    let mut abort_handles = Vec::new();
+    let mut join_set = JoinSet::new();
     for task in worker_tasks {
-        let h = AutoAbortHandle::new(set.spawn(task));
-        abort_handles.push(h);
+        join_set.spawn(task);
     }
 
     // The boss collects results from the workers,
     // merges them into a final result,
     // and reports progress
-    let boss_task = async move {
-        // open the output, aka the index file
-        let mut output_file = tokio::fs::File::create(Path::new(&args.output_path))
-            .await
-            .map_err(|e| {
-                return Error::CannotWrite { inner_err: e };
-            })?;
 
-        let mut final_res = GramToOffsets::new();
-        let mut indexed = 0;
-        let total = glob.tree.len();
-        // keep awaiting for worker results
-        // loop until all worker tasks are done
-        while let Some(res) = set.join_next().await {
-            indexed += 1;
-            match res {
-                Ok(Ok(r)) => {
-                    final_res.merge(r);
-                    yielder
-                        .send(IndexDirProgress::BuildIndexProgress(
-                            BuildIndexProgress::Updated { total, indexed },
-                        ))
-                        .await?;
-                    continue;
-                }
-                Ok(Err(e)) => {
-                    yielder
-                        .send(IndexDirProgress::BuildIndexProgress(
-                            BuildIndexProgress::UpdatedErr(e),
-                        ))
-                        .await?;
-                    continue;
-                }
-                Err(e) => {
-                    return Err(Error::TaskDiedWithJoinError { inner: e });
-                }
-            };
-        }
-        // write index to file
-        yielder.send(IndexDirProgress::WriteIndexStarted).await?;
-        let tree = Arc::try_unwrap(glob).map_err(|e| Error::LogicalError {
+    let mut final_res = GramToOffsets::new();
+    let mut indexed = 0;
+    let total = glob.tree.len();
+    // keep awaiting for worker results
+    // loop until all worker tasks are done
+    while let Some(res) = join_set.join_next().await {
+        indexed += 1;
+        match res {
+            Ok(Ok(r)) => {
+                final_res.merge(r);
+                yielder
+                    .send(Progress::IndexAdded {
+                        finished_entries: indexed,
+                        total_entries: total,
+                    })
+                    .await;
+                continue;
+            }
+            Ok(Err(e)) => {
+                continue;
+            }
+            Err(e) => {
+                return Err(Error::TaskDiedWithJoinError { inner: e });
+            }
+        };
+    }
+    yielder.send(Progress::Writing).await;
+    // write index to file
+    let tree = Arc::try_unwrap(glob).map_err(|e| Error::LogicalError {
                     message: "Unable to unwrap the globbed result. This should not happen because all tasks referencing it should be done at this point."
                         .to_string(),
                 })?;
-        write_index_result(
-            IndexResult {
-                gram_to_offsets: final_res,
-                compressed_tree: tree,
-            },
-            &mut output_file,
-        )
-        .await?;
-        yielder.send(IndexDirProgress::WriteIndexDone).await?;
-        Ok::<(), Error>(())
-    };
-    let h = tokio::spawn(boss_task);
-    abort_handles.push(AutoAbortHandle::new(h.abort_handle()));
-    abort_handles.shrink_to_fit();
-    h.await
-        .map_err(|e| Error::TaskDiedWithJoinError { inner: e })??;
+    write_index_result(
+        IndexResult {
+            gram_to_offsets: final_res,
+            compressed_tree: tree,
+        },
+        &mut output_file,
+    )
+    .await?;
     return Ok(());
 }
-
-// pub async fn index_directory(args: IndexArgs) {
-//     let (sender, mut recver) =
-//         tokio::sync::mpsc::channel::<IndexDirProgress>(args.channel_capacity);
-//     let progress_handling_task = tokio::spawn(async move {
-//         while let Some(progress) = recver.recv().await {
-//             match progress {
-//                 IndexDirProgress::YieldErr(e) => {
-//                     eprintln!("Error indexing file: {:?}", e);
-//                 }
-//                 IndexDirProgress::YieldFileIndexed { total, indexed } => {
-//                     println!("Indexed file {}/{}", indexed, total);
-//                 }
-//             }
-//         }
-//     });
-//     let indexing_task = tokio::spawn(async move {
-//         index_directory_with_progress(args, sender);
-//     });
-//     match indexing_task.await {
-//         Ok(_) => println!("Indexing completed successfully."),
-//         Err(e) => eprintln!("Indexing task panicked: {:?}", e),
-//     }
-// }

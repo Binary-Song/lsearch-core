@@ -1,32 +1,18 @@
-use crate::core::task::Channel;
+use crate::core::progress::Progress;
 
 use super::error::Error;
 use globset::{Glob, GlobSet, GlobSetBuilder};
 use itertools::Itertools;
-use std::ffi::os_str;
-use std::fmt::Display;
+use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
-use std::{fs, io};
-use tempfile::TempDir;
 
 #[derive(Debug)]
 pub struct GlobArgs {
     pub target_dir: String,
     pub includes: Vec<String>,
     pub excludes: Vec<String>,
-    pub report_glob_progress_interval: usize,
 }
 
-#[derive(Debug)]
-pub enum GlobProgress {
-    CompilePatternStarted,
-    CompilePatternDone,
-    GlobStarted,
-    GlobUpdated { total_entries: usize },
-    GlobUpdatedErr(Error),
-    GlobDone,
-}
 /// A file or directory.
 #[derive(Debug)]
 pub struct TreeEntry {
@@ -142,20 +128,13 @@ async fn glob_dir_recursive(
     dir_index: usize,
     inc_patts: &GlobSet,
     exc_patts: &GlobSet,
-    report_progress_interval: usize,
     report_counter: &mut usize,
-    yielder: &Channel<GlobProgress>,
+    yielder: &mut tokio::sync::mpsc::Sender<Progress>,
     result: &mut CompressedTree,
 ) -> Result<(), Error> {
     let entries = match fs::read_dir(dir_path) {
         Ok(entries) => entries,
         Err(e) => {
-            yielder
-                .send(GlobProgress::GlobUpdatedErr(Error::CannotRead {
-                    file_index: dir_index,
-                    inner_err: e,
-                }))
-                .await?;
             return Ok(()); // skip unreadable dirs
         }
     };
@@ -184,7 +163,6 @@ async fn glob_dir_recursive(
                 dir_index,
                 inc_patts,
                 exc_patts,
-                report_progress_interval,
                 report_counter,
                 yielder,
                 result,
@@ -192,25 +170,20 @@ async fn glob_dir_recursive(
         } else if path.is_file() && inc_patts.is_match(&path) && !exc_patts.is_match(&path) {
             add_to_compressed_tree(dir_index, &base_name, result);
             *report_counter += 1;
-            if *report_counter % report_progress_interval == 0 {
-                yielder
-                    .send(GlobProgress::GlobUpdated {
-                        total_entries: *report_counter,
-                    })
-                    .await?;
-            }
+            yielder
+                .send(Progress::GlobUpdated {
+                    entries: *report_counter,
+                })
+                .await;
         }
     }
     return Ok(());
 }
 
 pub async fn glob(
-    args: & GlobArgs,
-    yielder: &Channel<GlobProgress>,
+    args: &GlobArgs,
+    mut yielder: tokio::sync::mpsc::Sender<Progress>,
 ) -> Result<CompressedTree, Error> {
-    yielder
-        .send(GlobProgress::CompilePatternStarted)
-        .await?;
     let inc_patts_res = compile_patterns(&args.includes);
     let exc_patts_res = compile_patterns(&args.excludes);
     let (inc_patts, exc_patts) = match (inc_patts_res, exc_patts_res) {
@@ -226,21 +199,17 @@ pub async fn glob(
             (inc_patts, exc_patts)
         }
     };
-    yielder.send(GlobProgress::CompilePatternDone).await?;
     let mut compressed_tree = CompressedTree::new(args.target_dir.clone());
-    yielder.send(GlobProgress::GlobStarted).await?;
     glob_dir_recursive(
         args.target_dir.as_ref(),
         0,
         &inc_patts,
         &exc_patts,
-        args.report_glob_progress_interval,
         &mut 0,
-        yielder,
+        &mut yielder,
         &mut compressed_tree,
     )
     .await;
-    yielder.send(GlobProgress::GlobDone).await?;
     return Ok(compressed_tree);
 }
 
