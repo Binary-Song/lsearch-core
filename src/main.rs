@@ -6,10 +6,11 @@ use core::IndexArgs;
 use serde::Deserialize;
 use serde::Serialize;
 use serde_json::Value;
-use std::io::{BufRead, BufReader};
 use std::pin::Pin;
 use std::process::ExitCode;
+use tokio::io::AsyncBufReadExt;
 use tokio::io::AsyncWriteExt;
+use tokio::io::BufReader;
 use tokio::io::Stdout;
 
 #[derive(Deserialize)]
@@ -97,16 +98,16 @@ async fn handle_msg(msg: Value, out: Pin<&mut impl tokio::io::AsyncWrite>) -> Re
     }
 }
 
-async fn main_loop(mut out: Pin<&mut impl tokio::io::AsyncWrite>) -> Result<(), Error> {
-    let stdin = std::io::stdin();
-    let reader = BufReader::new(stdin);
-    for line in reader.lines() {
-        let line = match line {
-            Ok(l) => l,
-            Err(e) => {
-                return Err(Error::CannotRead { inner_err: e });
-            }
-        };
+async fn main_loop(
+    mut input: Pin<&mut impl tokio::io::AsyncBufRead>,
+    mut out: Pin<&mut impl tokio::io::AsyncWrite>,
+) -> Result<(), Error> {
+    let mut lines = input.as_mut().lines();
+    while let Some(line) = lines
+        .next_line()
+        .await
+        .map_err(|e| Error::CannotRead { inner_err: e })?
+    {
         let serde_value = match serde_json::from_str::<Value>(&line) {
             Ok(v) => v,
             Err(e) => {
@@ -120,9 +121,12 @@ async fn main_loop(mut out: Pin<&mut impl tokio::io::AsyncWrite>) -> Result<(), 
 
 #[tokio::main]
 async fn main() -> ExitCode {
+    let stdin = tokio::io::stdin();
+    let stdin = BufReader::new(stdin);
     let stdout = tokio::io::stdout();
+    let mut stdin = Box::pin(stdin);
     let mut stdout = Box::pin(stdout);
-    let result = main_loop(stdout.as_mut()).await;
+    let result = main_loop(stdin.as_mut(), stdout.as_mut()).await;
     match result {
         Ok(_) => ExitCode::SUCCESS,
         Err(e) => {
@@ -134,5 +138,35 @@ async fn main() -> ExitCode {
             stdout.as_mut().write_all(b).await.ok();
             ExitCode::FAILURE
         }
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use crate::*;
+
+    #[tokio::test]
+    async fn async_example_test() {
+        let file_path = file!(); // e.g., "src/main.rs"
+        let root_dir = std::path::Path::new(file_path)
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap();
+
+        handle_index_directory_request(
+            IndexRequest {
+                target_dir: root_dir.join("testgrounds").to_str().unwrap().to_string(),
+                includes: vec!["*".to_string()],
+                excludes: vec!["*.ignoreme".to_string()],
+                read_chunk_size: 1024,
+                gram_size: 4,
+                channel_capacity: 16,
+                output_path: root_dir.join("testgrounds.index").to_str().unwrap().to_string() ,
+            },
+            Pin::new(&mut tokio::io::sink()),
+        )
+        .await
+        .ok();
     }
 }
