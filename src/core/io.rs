@@ -3,6 +3,7 @@ use super::{
     glob::{CompressedTree, TreeEntry},
     index::{GramToOffsets, IndexResult, Offset},
 };
+use encoding_rs::WINDOWS_1252 as THE_ENCODING;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use tokio::io::AsyncWriteExt;
@@ -27,7 +28,7 @@ struct IOOffset(
 struct IOIndexResult {
     strings: Vec<String>,
     tree: Vec<IOTreeEntry>,
-    index: HashMap<Vec<u8>, Vec<IOOffset>>,
+    index: HashMap<String, Vec<IOOffset>>,
 }
 
 impl From<IndexResult> for IOIndexResult {
@@ -45,11 +46,12 @@ impl From<IndexResult> for IOIndexResult {
                 .map
                 .into_iter()
                 .map(|(gram, offsets)| {
+                    let (gram_string, _, _) = THE_ENCODING.decode(&gram);
                     let io_offsets = offsets
                         .into_iter()
                         .map(|offset| IOOffset(offset.file_id, offset.offset))
                         .collect();
-                    (gram, io_offsets)
+                    (gram_string.to_string(), io_offsets)
                 })
                 .collect(),
         }
@@ -78,7 +80,8 @@ impl Into<IndexResult> for IOIndexResult {
                     offset: io_offset.1,
                 })
                 .collect();
-            gram_to_offsets.map.insert(gram, offsets);
+            let gram_bytes = THE_ENCODING.encode(&gram).0.to_vec();
+            gram_to_offsets.map.insert(gram_bytes, offsets);
         }
         IndexResult {
             gram_to_offsets,
@@ -92,10 +95,13 @@ pub async fn write_index_result(
     out: &mut (impl AsyncWriteExt + std::marker::Unpin),
 ) -> Result<(), Error> {
     let io_index_result: IOIndexResult = index_result.into();
-    let bytes = serde_json::to_vec(&io_index_result).map_err(|e| {
-        return Error::JsonError { inner: e };
+    let bytes = serde_json::to_string(&io_index_result).map_err(|e| {
+        return Error::JsonError {
+            inner: e,
+            reason: "s5",
+        };
     })?;
-    out.write_all(&bytes).await.map_err(|e| {
+    out.write_all(bytes.as_bytes()).await.map_err(|e| {
         return Error::CannotWrite { inner_err: e };
     })?;
     Ok(())

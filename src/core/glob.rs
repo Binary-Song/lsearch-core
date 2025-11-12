@@ -1,6 +1,7 @@
 use crate::core::progress::Progress;
 
 use super::error::Error;
+use async_recursion::async_recursion;
 use globset::{Glob, GlobSet, GlobSetBuilder};
 use itertools::Itertools;
 use std::fs;
@@ -54,8 +55,11 @@ impl CompressedTree {
             components.push(name.clone());
             current_index = entry.parent_index;
         }
-        components.reverse();
-        let path = components.iter().collect::<PathBuf>();
+        components.push(self.strings[0].clone());
+        let mut path = PathBuf::new();
+        for component in components.iter().rev() {
+            path.push(component);
+        }
         return path;
     }
 }
@@ -123,6 +127,7 @@ fn add_to_compressed_tree(
 ///
 /// - `report_progress_interval`: The interval at which to report progress.
 ///
+#[async_recursion]
 async fn glob_dir_recursive(
     dir_path: &Path,
     dir_index: usize,
@@ -166,7 +171,8 @@ async fn glob_dir_recursive(
                 report_counter,
                 yielder,
                 result,
-            );
+            )
+            .await;
         } else if path.is_file() && inc_patts.is_match(&path) && !exc_patts.is_match(&path) {
             add_to_compressed_tree(dir_index, &base_name, result);
             *report_counter += 1;
@@ -212,6 +218,3 @@ pub async fn glob(
     .await;
     return Ok(compressed_tree);
 }
-
-#[cfg(test)]
-mod tests {}

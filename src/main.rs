@@ -6,6 +6,7 @@ use core::IndexArgs;
 use serde::Deserialize;
 use serde::Serialize;
 use serde_json::Value;
+use std::path::PathBuf;
 use std::pin::Pin;
 use std::process::ExitCode;
 use tokio::io::AsyncBufReadExt;
@@ -65,6 +66,10 @@ async fn handle_index_directory_request(
         output_path: args.output_path,
     };
     let (send, mut recv) = tokio::sync::mpsc::channel(args.channel_capacity);
+
+    // Spawn index_directory as a task so it runs concurrently with the message receiving loop
+    let index_task = tokio::spawn(async move { index_directory(args, send).await });
+
     while let Some(event) = recv.recv().await {
         let resp = match event {
             core::Progress::GlobUpdated { entries } => IndexResponse::GlobUpdated { entries },
@@ -77,22 +82,33 @@ async fn handle_index_directory_request(
             },
             core::Progress::Writing => IndexResponse::Writing,
         };
-        let v = serde_json::to_value(resp).map_err(|e| Error::JsonError { inner: e })?;
-        let line = serde_json::to_string(&v).map_err(|e| Error::JsonError { inner: e })? + "\n";
+        let v = serde_json::to_value(resp).map_err(|e| Error::JsonError {
+            reason: "s1",
+            inner: e,
+        })?;
+        let line = serde_json::to_string(&v).map_err(|e| Error::JsonError {
+            reason: "s2",
+            inner: e,
+        })? + "\n";
         out.as_mut()
             .write_all(line.as_bytes())
             .await
             .map_err(|e| Error::CannotWrite { inner_err: e })?;
     }
 
-    match index_directory(args, send).await {
-        Ok(_) => Ok(()),
-        Err(e) => Err(e),
+    // Wait for the indexing task to complete and return its result
+    match index_task.await {
+        Ok(Ok(_)) => Ok(()),
+        Ok(Err(e)) => Err(e),
+        Err(e) => Err(Error::TaskDiedWithJoinError { inner: e }),
     }
 }
 
 async fn handle_msg(msg: Value, out: Pin<&mut impl tokio::io::AsyncWrite>) -> Result<(), Error> {
-    let msg: Request = serde_json::from_value(msg).map_err(|e| Error::JsonError { inner: e })?;
+    let msg: Request = serde_json::from_value(msg).map_err(|e| Error::JsonError {
+        reason: "s3",
+        inner: e,
+    })?;
     match msg {
         Request::IndexDirectory(args) => handle_index_directory_request(args, out).await,
     }
@@ -111,7 +127,10 @@ async fn main_loop(
         let serde_value = match serde_json::from_str::<Value>(&line) {
             Ok(v) => v,
             Err(e) => {
-                return Err(Error::JsonError { inner: e });
+                return Err(Error::JsonError {
+                    reason: "s4",
+                    inner: e,
+                });
             }
         };
         handle_msg(serde_value, out.as_mut()).await?;
@@ -147,26 +166,27 @@ mod test {
 
     #[tokio::test]
     async fn async_example_test() {
-        let file_path = file!(); // e.g., "src/main.rs"
-        let root_dir = std::path::Path::new(file_path)
-            .parent()
-            .unwrap()
-            .parent()
-            .unwrap();
-
-        handle_index_directory_request(
+        let dir = std::env::var("TEST_RESOURCES_DIR").unwrap();
+        let test_res_dir = PathBuf::from(dir);
+        let output_index_path = test_res_dir.join("testgrounds.index");
+        if output_index_path.exists() {
+            std::fs::remove_file(&output_index_path).unwrap();
+        }
+        let result = handle_index_directory_request(
             IndexRequest {
-                target_dir: root_dir.join("testgrounds").to_str().unwrap().to_string(),
+                target_dir: test_res_dir.to_str().unwrap().to_string(),
                 includes: vec!["*".to_string()],
-                excludes: vec!["*.ignoreme".to_string()],
+                excludes: vec!["*.ignoreme".to_string(), "*.index".to_string()],
                 read_chunk_size: 1024,
                 gram_size: 4,
                 channel_capacity: 16,
-                output_path: root_dir.join("testgrounds.index").to_str().unwrap().to_string() ,
+                output_path: output_index_path.to_str().unwrap().to_string(),
             },
             Pin::new(&mut tokio::io::sink()),
         )
-        .await
-        .ok();
+        .await;
+        if let Err(e) = result {
+            panic!("Test failed with error: {:?}", e);
+        }
     }
 }

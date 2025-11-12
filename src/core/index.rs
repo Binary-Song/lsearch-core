@@ -83,13 +83,10 @@ async fn index_chunk(
         let gram = &chunk[i..i + args.gram_size];
         // insert fileid and fileoffset into res
         let file_id_to_offsets = res.map.entry(gram.to_vec()).or_default();
-        file_id_to_offsets.insert(
+        file_id_to_offsets.push(Offset {
             file_id,
-            Offset {
-                file_id,
-                offset: begin_offset + i,
-            },
-        );
+            offset: begin_offset + i,
+        });
     }
     return Ok(());
 }
@@ -100,6 +97,9 @@ async fn index_file(
     file_index: usize,
 ) -> Result<GramToOffsets, Error> {
     let path = glob.get_path(file_index);
+    if !path.is_file() {
+        return Ok(GramToOffsets::new());
+    }
     let file = File::open(&path).await;
     let mut file = file.map_err(|e| Error::CannotOpen {
         file_index: file_index,
@@ -212,10 +212,6 @@ pub async fn index_directory(
     for task in worker_tasks {
         join_set.spawn(task);
     }
-
-    // The boss collects results from the workers,
-    // merges them into a final result,
-    // and reports progress
 
     let mut final_res = GramToOffsets::new();
     let mut indexed = 0;

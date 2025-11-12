@@ -1,0 +1,49 @@
+{
+    // Use IntelliSense to learn about possible attributes.
+    // Hover to view descriptions of existing attributes.
+    // For more information, visit: https://go.microsoft.com/fwlink/?linkid=830387
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "type": "lldb",
+            "request": "launch",
+            "name": "Debug executable 'lsearch-core'",
+            "cargo": {
+                "args": [
+                    "build",
+                    "--bin=lsearch-core",
+                    "--package=lsearch-core"
+                ],
+                "filter": {
+                    "name": "lsearch-core",
+                    "kind": "bin"
+                }
+            },
+            "args": [],
+            "cwd": "${workspaceFolder}"
+        },
+        {
+            "type": "lldb",
+            "request": "launch",
+            "name": "Debug unit tests in executable 'lsearch-core'",
+            "cargo": {
+                "args": [
+                    "test",
+                    "--no-run",
+                    "--bin=lsearch-core",
+                    "--package=lsearch-core",
+                ],
+                "filter": {
+                    "name": "lsearch-core",
+                    "kind": "bin"
+                }
+            },
+            "args": ["--no-capture"],
+            "cwd": "${workspaceFolder}",
+            "env": {
+                "TEST_RESOURCES_DIR": "${workspaceFolder}\\test_resources",
+                "RUST_BACKTRACE": "1"
+            }
+        }
+    ]
+}

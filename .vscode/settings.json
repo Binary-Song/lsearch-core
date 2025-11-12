@@ -1,0 +1,5 @@
+{
+    "rust-analyzer.runnables.extraEnv": {
+        "TEST_RESOURCES_DIR": "${workspaceFolder}/test_resources"
+    }, 
+}

@@ -29,6 +29,7 @@ pub enum Error {
     },
     TaskClosedTheChannel,
     JsonError {
+        reason: &'static str,
         inner: serde_json::Error,
     },
     SendError {
@@ -67,8 +68,8 @@ impl Display for Error {
             Error::TaskDiedWithJoinError { inner } => {
                 write!(f, "Task panicked: {}", inner)?;
             }
-            Error::JsonError { inner } => {
-                write!(f, "Serde JSON failed: {}", inner)?;
+            Error::JsonError { inner, reason } => {
+                write!(f, "Serde JSON failed: {}, {}", inner, reason)?;
             }
             Error::CannotWrite { inner_err } => write!(f, "Cannot write to file: {}", inner_err)?,
             Error::LogicalError { message } => write!(f, "Logical error: {}", message)?,
