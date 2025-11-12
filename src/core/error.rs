@@ -42,6 +42,9 @@ pub enum Error {
         message: String,
     },
     BadRequest,
+    DecodeUtf8Error {
+        error: std::string::FromUtf8Error,
+    }
 }
 
 impl Display for Error {
@@ -77,6 +80,7 @@ impl Display for Error {
             Error::SendError { message } => write!(f, "Send error: {}", message)?,
             Error::RecvError { message } => write!(f, "Receive error: {}", message)?,
             Error::BadRequest => write!(f, "Bad Request",)?,
+            Error::DecodeUtf8Error { error } => write!(f, "UTF-8 decode error: {}", error)?,
         }
         Ok(())
     }

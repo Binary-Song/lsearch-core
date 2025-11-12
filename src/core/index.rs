@@ -2,14 +2,11 @@ use super::error::Error;
 use super::glob::{glob, CompressedTree, GlobArgs};
 use crate::core::io::write_index_result;
 use crate::core::progress::Progress;
-use futures::{pin_mut, AsyncWriteExt};
 use std::collections::HashMap;
-use std::future::Future;
 use std::path::Path;
 use std::sync::Arc;
 use tokio::task::JoinSet;
 use tokio::{fs::File, io::AsyncReadExt};
-use tokio_stream::StreamExt;
 
 #[derive(Debug, Clone)]
 pub struct IndexArgs {
@@ -119,12 +116,10 @@ async fn index_file(
 
     loop {
         // read the next chunk
-        let bytes_read =
-            file.read(&mut chunk[padding_size..])
-                .await
-                .map_err(|e| Error::CannotRead {
-                    inner_err: e,
-                })?;
+        let bytes_read = file
+            .read(&mut chunk[padding_size..])
+            .await
+            .map_err(|e| Error::CannotRead { inner_err: e })?;
 
         if bytes_read == 0 {
             // EOF

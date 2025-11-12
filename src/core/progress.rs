@@ -8,4 +8,8 @@ pub enum Progress {
         total_entries: usize,
     },
     Writing,
+    FileSearched {
+        finished_files: usize,
+        total_files: usize,
+    }
 }

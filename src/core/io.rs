@@ -5,8 +5,8 @@ use super::{
 };
 use encoding_rs::WINDOWS_1252 as THE_ENCODING;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
-use tokio::io::AsyncWriteExt;
+use std::{collections::HashMap, pin::Pin};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 #[derive(Serialize, Deserialize, Debug)]
 struct IOTreeEntry(
@@ -105,4 +105,22 @@ pub async fn write_index_result(
         return Error::CannotWrite { inner_err: e };
     })?;
     Ok(())
+}
+
+pub async fn read_index_result(
+    mut input: Pin<&mut impl AsyncReadExt>,
+) -> Result<IndexResult, Error> {
+    let mut contents = Vec::new();
+    input
+        .read_to_end(&mut contents)
+        .await
+        .map_err(|e| Error::CannotRead { inner_err: e })?;
+    let str = String::from_utf8(contents).map_err(|e| Error::DecodeUtf8Error { error: e })?;
+    let io_index_result: IOIndexResult = serde_json::from_str(&str).map_err(|e| {
+        return Error::JsonError {
+            inner: e,
+            reason: "s6",
+        };
+    })?;
+    Ok(io_index_result.into())
 }
