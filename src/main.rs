@@ -81,6 +81,10 @@ async fn handle_index_directory_request(
                 total_entries,
             },
             core::Progress::Writing => IndexResponse::Writing,
+            core::Progress::FileSearched { .. } => {
+                // This is for search progress, not index progress - skip it
+                continue;
+            }
         };
         let v = serde_json::to_value(resp).map_err(|e| Error::JsonError {
             reason: "s1",
