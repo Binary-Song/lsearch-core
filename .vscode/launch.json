@@ -7,36 +7,12 @@
         {
             "type": "lldb",
             "request": "launch",
-            "name": "Debug executable 'lsearch-core'",
-            "cargo": {
-                "args": [
-                    "build",
-                    "--bin=lsearch-core",
-                    "--package=lsearch-core"
-                ],
-                "filter": {
-                    "name": "lsearch-core",
-                    "kind": "bin"
-                }
-            },
-            "args": [],
-            "cwd": "${workspaceFolder}"
-        },
-        {
-            "type": "lldb",
-            "request": "launch",
             "name": "Debug unit tests in executable 'lsearch-core'",
             "cargo": {
                 "args": [
                     "test",
-                    "--no-run",
-                    "--bin=lsearch-core",
-                    "--package=lsearch-core",
-                ],
-                "filter": {
-                    "name": "lsearch-core",
-                    "kind": "bin"
-                }
+                    "index_dir_test",
+                ]
             },
             "args": ["--no-capture"],
             "cwd": "${workspaceFolder}",

@@ -1,13 +1,18 @@
+use std::path::PathBuf;
+
 #[derive(Debug)]
 pub enum Progress {
     GlobUpdated {
         entries: usize,
     },
+    GlobDone,
     IndexAdded {
         finished_entries: usize,
         total_entries: usize,
     },
-    Writing,
+    IndexWritten {
+        output_path: PathBuf,
+    },
     FileSearched {
         finished_files: usize,
         total_files: usize,

@@ -1,7 +1,7 @@
 use super::{
     error::Error,
     glob::{CompressedTree, TreeEntry},
-    index::{GramToOffsets, IndexResult, Offset},
+    index::{Index, IndexMap, Offset},
 };
 use encoding_rs::WINDOWS_1252 as THE_ENCODING;
 use serde::{Deserialize, Serialize};
@@ -9,89 +9,102 @@ use std::{collections::HashMap, pin::Pin};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 #[derive(Serialize, Deserialize, Debug)]
-struct IOTreeEntry(
-    /// parent_index
-    usize,
-    /// string_index
-    usize,
-);
+struct IOTreeEntry {
+    parent_id: usize,
+    string_id: usize,
+}
 
 #[derive(Serialize, Deserialize, Debug)]
-struct IOOffset(
-    /// file_index
-    usize,
-    /// offset
-    usize,
-);
+struct IOOffset {
+    file_id: usize,
+    offset: usize,
+}
 
 #[derive(Serialize, Deserialize, Debug)]
 struct IOIndexResult {
-    strings: Vec<String>,
-    tree: Vec<IOTreeEntry>,
+    strings: HashMap<usize, String>,
+    tree: HashMap<usize, IOTreeEntry>,
     index: HashMap<String, Vec<IOOffset>>,
 }
 
-impl From<IndexResult> for IOIndexResult {
-    fn from(src: IndexResult) -> Self {
+impl From<Index> for IOIndexResult {
+    fn from(src: Index) -> Self {
         IOIndexResult {
-            strings: src.compressed_tree.strings,
+            strings: src.tree.get_string_iter()
+                .map(|(string_id, string)| {
+                    (string_id.clone(), string.to_string())
+                })
+                .collect::<HashMap<usize, String>>(),
             tree: src
-                .compressed_tree
                 .tree
-                .into_iter()
-                .map(|entry| IOTreeEntry(entry.parent_index, entry.string_index))
-                .collect(),
+                .get_tree_iter()
+                .map(|(entry_id, entry)| {
+                    (
+                        entry_id.clone(),
+                        IOTreeEntry {
+                            parent_id: entry.parent_index,
+                            string_id: entry.string_index,
+                        },
+                    )
+                }).collect::<HashMap<usize, IOTreeEntry>>(),
             index: src
-                .gram_to_offsets
-                .map
-                .into_iter()
+                .map.into_iter()
                 .map(|(gram, offsets)| {
-                    let (gram_string, _, _) = THE_ENCODING.decode(&gram);
+                    let gram_str = THE_ENCODING.decode(&gram).0.to_string();
                     let io_offsets = offsets
                         .into_iter()
-                        .map(|offset| IOOffset(offset.file_id, offset.offset))
-                        .collect();
-                    (gram_string.to_string(), io_offsets)
-                })
-                .collect(),
+                        .map(|offset| IOOffset {
+                            file_id: offset.file_id,
+                            offset: offset.offset,
+                        })
+                        .collect::<Vec<IOOffset>>();
+                    (gram_str, io_offsets)
+                }).collect::<_>(),
         }
     }
 }
 
-impl Into<IndexResult> for IOIndexResult {
-    fn into(self) -> IndexResult {
-        let compressed_tree = CompressedTree {
-            strings: self.strings,
-            tree: self
-                .tree
-                .into_iter()
-                .map(|entry| TreeEntry {
-                    parent_index: entry.0,
-                    string_index: entry.1,
-                })
-                .collect(),
-        };
-        let mut gram_to_offsets = GramToOffsets::new();
-        for (gram, io_offsets) in self.index {
-            let offsets = io_offsets
-                .into_iter()
-                .map(|io_offset| Offset {
-                    file_id: io_offset.0,
-                    offset: io_offset.1,
-                })
-                .collect();
-            let gram_bytes = THE_ENCODING.encode(&gram).0.to_vec();
-            gram_to_offsets.map.insert(gram_bytes, offsets);
+impl Into<Index> for IOIndexResult {
+    fn into(self) -> Index {
+        let mut tree = CompressedTree::new_empty();
+        
+        // Reconstruct strings
+        for (string_id, string) in self.strings {
+            tree.soft_set_string(string_id, string).ok();
         }
-        IndexResult {
-            gram_to_offsets,
-            compressed_tree,
+        
+        // Reconstruct tree entries
+        for (entry_id, io_entry) in self.tree {
+            tree.soft_set_tree_entry(entry_id, TreeEntry {
+                parent_index: io_entry.parent_id,
+                string_index: io_entry.string_id,
+            }).ok();
         }
+        
+        // Reconstruct index map
+        let mut map = IndexMap::new();
+        for (gram_str, io_offsets) in self.index {
+            let gram_bytes = THE_ENCODING.encode(&gram_str).0;
+            // Convert to fixed-size array
+            if gram_bytes.len() == super::index::GRAM_SIZE {
+                let mut gram = [0u8; super::index::GRAM_SIZE];
+                gram.copy_from_slice(&gram_bytes[0..super::index::GRAM_SIZE]);
+                
+                for io_offset in io_offsets {
+                    map.insert(gram, Offset {
+                        file_id: io_offset.file_id,
+                        offset: io_offset.offset,
+                    });
+                }
+            }
+        }
+        
+        Index { tree, map }
     }
 }
 
 pub async fn write_index_result(
-    index_result: IndexResult,
+    index_result: Index,
     out: &mut (impl AsyncWriteExt + std::marker::Unpin),
 ) -> Result<(), Error> {
     let io_index_result: IOIndexResult = index_result.into();
@@ -107,9 +120,7 @@ pub async fn write_index_result(
     Ok(())
 }
 
-pub async fn read_index_result(
-    mut input: Pin<&mut impl AsyncReadExt>,
-) -> Result<IndexResult, Error> {
+pub async fn read_index_result(mut input: Pin<&mut impl AsyncReadExt>) -> Result<Index, Error> {
     let mut contents = Vec::new();
     input
         .read_to_end(&mut contents)

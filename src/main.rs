@@ -1,4 +1,5 @@
-mod core;
+pub mod core;
+mod prelude;
 
 use crate::core::Error;
 use core::index_directory;
@@ -30,12 +31,12 @@ enum Response {
 #[derive(Deserialize)]
 struct IndexRequest {
     target_dir: String,
+    output_dir: String,
     includes: Vec<String>,
     excludes: Vec<String>,
     read_chunk_size: usize,
-    gram_size: usize,
     channel_capacity: usize,
-    output_path: String,
+    break_size: usize,
 }
 
 #[derive(Serialize)]
@@ -44,11 +45,14 @@ enum IndexResponse {
     GlobUpdated {
         entries: usize,
     },
+    GlobDone,
     IndexAdded {
         finished_entries: usize,
         total_entries: usize,
     },
-    Writing,
+    IndexWritten {
+        path: String,
+    },
     Finished,
 }
 
@@ -61,9 +65,9 @@ async fn handle_index_directory_request(
         includes: args.includes,
         excludes: args.excludes,
         read_chunk_size: args.read_chunk_size,
-        gram_size: args.gram_size,
         channel_capacity: args.channel_capacity,
-        output_path: args.output_path,
+        output_dir: args.output_dir,
+        break_size: args.break_size,
     };
     let (send, mut recv) = tokio::sync::mpsc::channel(args.channel_capacity);
 
@@ -73,6 +77,7 @@ async fn handle_index_directory_request(
     while let Some(event) = recv.recv().await {
         let resp = match event {
             core::Progress::GlobUpdated { entries } => IndexResponse::GlobUpdated { entries },
+            core::Progress::GlobDone => IndexResponse::GlobDone,
             core::Progress::IndexAdded {
                 finished_entries,
                 total_entries,
@@ -80,7 +85,9 @@ async fn handle_index_directory_request(
                 finished_entries,
                 total_entries,
             },
-            core::Progress::Writing => IndexResponse::Writing,
+            core::Progress::IndexWritten { output_path } => IndexResponse::IndexWritten {
+                path: output_path.to_string_lossy().to_string(),
+            },
             core::Progress::FileSearched { .. } => {
                 // This is for search progress, not index progress - skip it
                 continue;
@@ -169,24 +176,25 @@ mod test {
     use crate::*;
 
     #[tokio::test]
-    async fn async_example_test() {
-        let dir = std::env::var("TEST_RESOURCES_DIR").unwrap();
+    async fn index_dir_test() {
+        let dir = "E:\\trash\\chromium-main\\";
+        println!("{:?}", dir);
         let test_res_dir = PathBuf::from(dir);
-        let output_index_path = test_res_dir.join("testgrounds.index");
+        let output_index_path = test_res_dir.join(".index");
         if output_index_path.exists() {
-            std::fs::remove_file(&output_index_path).unwrap();
+            std::fs::remove_dir_all(&output_index_path).unwrap();
         }
         let result = handle_index_directory_request(
             IndexRequest {
                 target_dir: test_res_dir.to_str().unwrap().to_string(),
                 includes: vec!["*".to_string()],
                 excludes: vec!["*.ignoreme".to_string(), "*.index".to_string()],
-                read_chunk_size: 1024,
-                gram_size: 4,
+                read_chunk_size: 1024 * 512,
                 channel_capacity: 16,
-                output_path: output_index_path.to_str().unwrap().to_string(),
+                break_size: 1024 * 128 * 10,
+                output_dir: output_index_path.to_str().unwrap().to_string(),
             },
-            Pin::new(&mut tokio::io::sink()),
+            Pin::new(&mut tokio::io::stdout()),
         )
         .await;
         if let Err(e) = result {

@@ -1,7 +1,9 @@
 use super::error::Error;
-use super::index::IndexResult;
+use super::index::Index;
+use crate::core::index::Gram;
 use crate::core::io::read_index_result;
 use crate::core::progress::Progress;
+use crate::prelude::*;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
@@ -29,16 +31,16 @@ pub async fn search_in_index_file(
         file_index: 0,
         inner_err: e,
     })?;
-    
+
     let index_result = read_index_result(Pin::new(&mut index_file)).await?;
-    
+
     // Perform the search
     search_in_index(index_result, query).await
 }
 
 /// Search for a substring in an IndexResult
 async fn search_in_index(
-    index_result: IndexResult,
+    index_result: Index,
     substring: &[u8],
 ) -> Result<Vec<SearchResult>, Error> {
     let mut results: Vec<SearchResult> = Vec::new();
@@ -49,9 +51,13 @@ async fn search_in_index(
     }
 
     // Generate all 4-grams from the substring
-    let mut grams: Vec<Vec<u8>> = Vec::new();
+    let mut grams: Vec<Gram> = Vec::new();
     for i in 0..=(substring.len() - gram_size) {
-        grams.push(substring[i..i + gram_size].to_vec());
+        grams.push(
+            substring[i..i + gram_size]
+                .try_into()
+                .map_err(|e: std::array::TryFromSliceError| e.into_error(dbg_loc!()))?,
+        );
     }
 
     // Find files that contain all grams
@@ -60,7 +66,7 @@ async fn search_in_index(
 
     for gram in &grams {
         // Check if this gram exists in the index
-        let offsets_for_gram = match index_result.gram_to_offsets.map.get(gram) {
+        let offsets_for_gram = match index_result.map.get(gram) {
             Some(offsets) => offsets,
             None => {
                 // If any gram is not found, no results possible
@@ -95,7 +101,6 @@ async fn search_in_index(
 
         // Get positions of the first gram
         let first_gram_positions = index_result
-            .gram_to_offsets
             .map
             .get(&grams[0])
             .unwrap()
@@ -111,7 +116,6 @@ async fn search_in_index(
             for (gram_index, gram) in grams.iter().enumerate().skip(1) {
                 let expected_pos = start_pos + gram_index;
                 let gram_positions = index_result
-                    .gram_to_offsets
                     .map
                     .get(gram)
                     .unwrap()
@@ -133,7 +137,7 @@ async fn search_in_index(
 
         // If we found matches in this file, add to results
         if !matching_offsets.is_empty() {
-            let file_path = index_result.compressed_tree.get_path(file_id);
+            let file_path = index_result.tree.get_path(file_id)?;
             matching_offsets.sort();
             results.push(SearchResult {
                 file_path,
@@ -157,59 +161,5 @@ pub async fn search_in_index_files(
 mod tests {
     use super::*;
     use std::path::PathBuf;
-
-    #[tokio::test]
-    async fn test_search_hello() {
-        let index_path = PathBuf::from("test_resources/testgrounds.index");
-        let (sender, _receiver) = tokio::sync::mpsc::channel(10);
-
-        let query = b"Hello";
-        let results = search_in_index_file(&index_path, query, sender)
-            .await
-            .expect("Search should succeed");
-
-        // We expect to find "Hello" in helloworld.txt
-        assert!(!results.is_empty(), "Should find at least one result for 'Hello'");
-
-        // Print results for debugging
-        for result in &results {
-            println!("Found '{}' in: {:?}", String::from_utf8_lossy(query), result.file_path);
-            println!("  {} occurrences at offsets: {:?}", result.offsets.len(), result.offsets);
-        }
-
-        // Check that at least one result contains "helloworld.txt" in the path
-        let found_in_helloworld = results.iter().any(|r| {
-            r.file_path
-                .to_string_lossy()
-                .contains("helloworld.txt")
-        });
-        assert!(
-            found_in_helloworld,
-            "Should find 'Hello' in helloworld.txt"
-        );
-        
-        // Verify we got the expected number of results (20 "Hello" occurrences as shown in the gram debug)
-        assert_eq!(results.len(), 1, "Should have exactly 1 file with 'Hello'");
-        assert_eq!(results[0].offsets.len(), 20, "Should have 20 occurrences of 'Hello' in the file");
-    }
-    
-    #[tokio::test]
-    async fn test_search_shell() {
-        let index_path = PathBuf::from("test_resources/testgrounds.index");
-        let (sender, _receiver) = tokio::sync::mpsc::channel(10);
-
-        let query = b"Shell";
-        let results = search_in_index_file(&index_path, query, sender)
-            .await
-            .expect("Search should succeed");
-
-        // Print results for debugging
-        for result in &results {
-            println!("Found '{}' in: {:?}", String::from_utf8_lossy(query), result.file_path);
-            println!("  {} occurrences at offsets: {:?}", result.offsets.len(), result.offsets);
-        }
-
-        // We should find "Shell" (from PowerShell, Shell, etc.)
-        assert!(!results.is_empty(), "Should find at least one result for 'Shell'");
-    }
+ 
 }

@@ -1,9 +1,12 @@
-use crate::core::progress::Progress;
-
 use super::error::Error;
+use crate::core::error::IntoError;
+use crate::core::progress::Progress;
+use crate::prelude::*;
 use async_recursion::async_recursion;
+pub use compressed_tree::CompressedTree;
 use globset::{Glob, GlobSet, GlobSetBuilder};
 use itertools::Itertools;
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -15,7 +18,7 @@ pub struct GlobArgs {
 }
 
 /// A file or directory.
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TreeEntry {
     /// The parent dir of this entry. An index into `CompressedTree.tree`.
     pub parent_index: usize,
@@ -23,44 +26,251 @@ pub struct TreeEntry {
     pub string_index: usize,
 }
 
-#[derive(Debug)]
-pub struct CompressedTree {
-    pub strings: Vec<String>,
-    pub tree: Vec<TreeEntry>,
+/// This module is to protect the internal fields of CompressedTree from being accessed wildly.
+/// Key, index, id are the same thing here (sry for the confusion)
+mod compressed_tree {
+    use super::*;
+    #[derive(Debug)]
+    pub struct CompressedTree {
+        _strings: HashMap<usize, String>,
+        _tree: HashMap<usize, TreeEntry>,
+        _next_string_id: usize,
+        _next_tree_id: usize,
+    }
+    enum DupKeyAction {
+        Error,
+        CheckEqual,
+        Overwrite,
+    }
+    /// Adds kv pair to an internal hash map. Returns error if key already exists, the key if successful.
+    /// - `key`: Optional key to use. If None, auto-increment `key_gen` to get a new key.
+    /// - `val`: The value to insert.
+    /// - `map`: The hash map to insert into.
+    /// - `id_to_err`: A function that generates an Error given a key and a bool indicating whether
+    ///  the key was auto-generated.
+    #[inline(always)]
+    fn add_item<V: PartialEq>(
+        key: Option<usize>,
+        key_gen: &mut usize,
+        val: V,
+        map: &mut HashMap<usize, V>,
+        id_to_err: impl Fn(usize, bool) -> Error,
+        dup_key_action: DupKeyAction,
+    ) -> Result<usize, Error> {
+        use std::collections::hash_map::Entry;
+        let should_gen_key = key.is_none();
+        let key = match key {
+            Some(k) => k,
+            None => {
+                let key = *key_gen;
+                *key_gen += 1;
+                key
+            }
+        };
+        match map.entry(key) {
+            Entry::Occupied(mut _occ_ent) => match dup_key_action {
+                DupKeyAction::Error => {
+                    return id_to_err(key, should_gen_key).into_result();
+                }
+                DupKeyAction::CheckEqual => {
+                    // check equality
+                    let existing_val = _occ_ent.get();
+                    if *existing_val != val {
+                        return id_to_err(key, should_gen_key).into_result();
+                    }
+                    return Ok(key);
+                }
+                DupKeyAction::Overwrite => {
+                    *_occ_ent.get_mut() = val;
+                    return Ok(key);
+                }
+            },
+            Entry::Vacant(ent) => {
+                ent.insert(val); // map[id] = s
+                return Ok(key);
+            }
+        }
+    }
+
+    impl CompressedTree {
+        pub fn new_empty() -> Self {
+            Self {
+                _strings: HashMap::new(),
+                _tree: HashMap::new(),
+                _next_string_id: 0,
+                _next_tree_id: 0,
+            }
+        }
+        pub fn new(root_dir: String) -> Self {
+            let mut c = CompressedTree {
+                _strings: HashMap::new(),
+                _tree: HashMap::new(),
+                _next_string_id: 1,
+                _next_tree_id: 1,
+            };
+            c._strings.insert(0, root_dir);
+            c._tree.insert(
+                0,
+                TreeEntry {
+                    parent_index: 0,
+                    string_index: 0,
+                },
+            );
+            c
+        }
+
+        pub fn get_tree_iter(&self) -> impl Iterator<Item = (&usize, &TreeEntry)> {
+            self._tree.iter()
+        }
+
+        pub fn get_tree_len(&self) -> usize {
+            self._tree.len()
+        }
+
+        pub fn get_tree_entry(&self, index: usize) -> Option<TreeEntry> {
+            self._tree.get(&index).cloned()
+        }
+
+        pub fn get_string(&self, index: usize) -> Option<String> {
+            self._strings.get(&index).cloned()
+        }
+
+        pub fn add_string(&mut self, s: String) -> Result<usize, Error> {
+            add_item(
+                None,
+                &mut self._next_string_id,
+                s,
+                &mut self._strings,
+                |id, is_auto_key| {
+                    format!("String ID collision: {}, auto: {}", id, is_auto_key)
+                        .into_error(dbg_loc!())
+                },
+                DupKeyAction::Error,
+            )
+        }
+
+        pub fn add_tree_entry(&mut self, tree_ent: TreeEntry) -> Result<usize, Error> {
+            add_item(
+                None,
+                &mut self._next_tree_id,
+                tree_ent,
+                &mut self._tree,
+                |id, is_auto_key| {
+                    format!("TreeEntry ID collision: {}, auto: {}", id, is_auto_key)
+                        .into_error(dbg_loc!())
+                },
+                DupKeyAction::Error,
+            )
+        }
+
+        pub fn get_string_iter(&self) -> impl Iterator<Item = (&usize, &String)> {
+            self._strings.iter()
+        }
+
+        pub fn merge(&mut self, other: Self) {
+            for (id, s) in other._strings {
+                self.soft_set_string(id, s).ok();
+            }
+            for (id, tree_ent) in other._tree {
+                self.soft_set_tree_entry(id, tree_ent).ok();
+            }
+            self._next_string_id = self._next_string_id.max(other._next_string_id);
+            self._next_tree_id = self._next_tree_id.max(other._next_tree_id);
+        }
+
+        pub fn soft_set_string(&mut self, id: usize, s: String) -> Result<usize, Error> {
+            add_item(
+                Some(id),
+                &mut 0,
+                s,
+                &mut self._strings,
+                |id, is_auto_key| {
+                    format!(
+                        "Trying to reassign ID a different value. Id: {}, auto: {}",
+                        id, is_auto_key
+                    )
+                    .into_error(dbg_loc!())
+                },
+                DupKeyAction::CheckEqual,
+            )
+        }
+
+        pub fn soft_set_tree_entry(
+            &mut self,
+            id: usize,
+            tree_ent: TreeEntry,
+        ) -> Result<usize, Error> {
+            add_item(
+                Some(id),
+                &mut 0,
+                tree_ent,
+                &mut self._tree,
+                |id, is_auto_key| {
+                    format!(
+                        "Trying to reassign ID a different value. Id: {}, auto: {}",
+                        id, is_auto_key
+                    )
+                    .into_error(dbg_loc!())
+                },
+                DupKeyAction::CheckEqual,
+            )
+        }
+    }
 }
 
 impl CompressedTree {
-    fn new(root_dir: String) -> Self {
-        CompressedTree {
-            strings: vec![root_dir],
-            tree: vec![TreeEntry {
-                parent_index: 0,
-                string_index: 0,
-            }],
-        }
+    pub fn get_path(&self, index: usize) -> Result<PathBuf, Error> {
+        self.get_path_and_record_dependency(index, None)
     }
 
-    fn add_string(&mut self, s: String) -> usize {
-        let index = self.strings.len();
-        self.strings.push(s);
-        return index;
-    }
-
-    pub fn get_path(&self, index: usize) -> PathBuf {
+    pub fn get_path_and_record_dependency(
+        &self,
+        index: usize,
+        mut dep_tree: Option<&mut Self>,
+    ) -> Result<PathBuf, Error> {
+        // helper functions to record the used entries in self into dep_tree
+        let record_string = |string_id: usize, string: String, dep_tree: &mut Option<&mut Self>| {
+            dep_tree
+                .as_mut()
+                .map(|dep_tree| dep_tree.soft_set_string(string_id, string));
+        };
+        let record_tree_entry =
+            |tree_index: usize, tree_entry: TreeEntry, dep_tree: &mut Option<&mut Self>| {
+                dep_tree
+                    .as_mut()
+                    .map(|dep_tree| dep_tree.soft_set_tree_entry(tree_index, tree_entry));
+            };
+        // this is the result path. will be reversed later
         let mut components = Vec::new();
-        let mut current_index = index;
-        while current_index != 0 {
-            let entry = &self.tree[current_index];
-            let name = &self.strings[entry.string_index];
+        let mut current_tree_id = index;
+        // walk up the chain to build the full path
+        while current_tree_id != 0 {
+            let entry = self
+                .get_tree_entry(current_tree_id)
+                .ok_or(format!("Invalid tree index: {}", current_tree_id).into_error(dbg_loc!()))?;
+
+            record_tree_entry(current_tree_id, entry.clone(), &mut dep_tree);
+
+            let name = self.get_string(entry.string_index).ok_or(
+                format!("Invalid string index: {}", entry.string_index).into_error(dbg_loc!()),
+            )?;
+
+            record_string(entry.string_index, name.clone(), &mut dep_tree);
+
             components.push(name.clone());
-            current_index = entry.parent_index;
+            current_tree_id = entry.parent_index;
         }
-        components.push(self.strings[0].clone());
+        let path_at_0 = self
+            .get_string(0)
+            .ok_or(format!("Invalid string index: 0",).into_error(dbg_loc!()))?;
+        components.push(path_at_0.clone());
+        record_string(0, path_at_0, &mut dep_tree);
+
         let mut path = PathBuf::new();
         for component in components.iter().rev() {
             path.push(component);
         }
-        return path;
+        return Ok(path);
     }
 }
 
@@ -74,10 +284,7 @@ fn compile_patterns(strs: &Vec<String>) -> CompiledPatterns {
         patts
             .iter()
             .map(|pattern_str| {
-                Glob::new(pattern_str).map_err(|e| Error::InvalidPattern {
-                    pattern: pattern_str.clone(),
-                    inner: e,
-                })
+                Glob::new(pattern_str).map_err(|e| e.into_error(dbg_loc!())(pattern_str.clone()))
             })
             .partition_map(|res| match res {
                 Ok(pat) => itertools::Either::Left(pat),
@@ -106,13 +313,13 @@ fn add_to_compressed_tree(
     parent_index: usize,
     base_name: &str,
     compressed_tree: &mut CompressedTree,
-) -> usize {
-    let string_index = compressed_tree.add_string(base_name.to_string());
-    compressed_tree.tree.push(TreeEntry {
+) -> Result<usize, Error> {
+    let string_index = compressed_tree.add_string(base_name.to_string())?;
+    let tree_entry = TreeEntry {
         parent_index,
         string_index,
-    });
-    return compressed_tree.tree.len() - 1;
+    };
+    compressed_tree.add_tree_entry(tree_entry)
 }
 
 /// Add files and directories from a directory recursively to the compressed tree.
@@ -162,7 +369,7 @@ async fn glob_dir_recursive(
         }
         // the recursive case: glob sub dirs
         if path.is_dir() {
-            let dir_index = add_to_compressed_tree(dir_index, &base_name, result);
+            let dir_index = add_to_compressed_tree(dir_index, &base_name, result)?;
             glob_dir_recursive(
                 &path,
                 dir_index,

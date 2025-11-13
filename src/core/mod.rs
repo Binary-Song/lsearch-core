@@ -3,12 +3,12 @@
 //! The Core must not depend on the interface module.
 //!
 
-mod error;
-mod glob;
-mod index;
-mod io;
-mod progress;
-mod search;
+pub mod error;
+pub mod glob;
+pub mod index;
+pub mod io;
+pub mod progress;
+pub mod search;
 
 pub use error::Error;
 pub use index::index_directory;
