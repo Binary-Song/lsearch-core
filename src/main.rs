@@ -188,7 +188,7 @@ mod test {
                 excludes: vec!["*.ignoreme".to_string(), "*.index".to_string()],
                 read_chunk_size: 1024 * 512,
                 channel_capacity: 16,
-                break_size: 1024 * 128 * 10,
+                break_size: 1024 * 1024 * 64,
                 output_dir: output_index_path.to_str().unwrap().to_string(),
                 workers: num_cpus::get(),
             },

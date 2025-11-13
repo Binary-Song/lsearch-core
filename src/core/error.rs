@@ -56,6 +56,7 @@ pub enum Error {
         reason: &'static str,
         inner: serde_json::Error,
     },
+    PostcardError  ,
     SendError {
         message: String,
     },
@@ -153,6 +154,9 @@ impl Display for Error {
             Error::DecodeUtf8Error { error } => write!(f, "UTF-8 decode error: {}", error)?,
             Error::CannotConvertSlideToArray { error } => {
                 write!(f, "Cannot convert slice to array: {}", error)?
+            },
+            Error::PostcardError {} => {
+                write!(f, "Postcard serialization/deserialization error")?
             }
         }
         Ok(())

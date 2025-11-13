@@ -30,10 +30,10 @@ struct IOIndexResult {
 impl From<Index> for IOIndexResult {
     fn from(src: Index) -> Self {
         IOIndexResult {
-            strings: src.tree.get_string_iter()
-                .map(|(string_id, string)| {
-                    (string_id.clone(), string.to_string())
-                })
+            strings: src
+                .tree
+                .get_string_iter()
+                .map(|(string_id, string)| (string_id.clone(), string.to_string()))
                 .collect::<HashMap<usize, String>>(),
             tree: src
                 .tree
@@ -46,9 +46,11 @@ impl From<Index> for IOIndexResult {
                             string_id: entry.string_index,
                         },
                     )
-                }).collect::<HashMap<usize, IOTreeEntry>>(),
+                })
+                .collect::<HashMap<usize, IOTreeEntry>>(),
             index: src
-                .map.into_iter()
+                .map
+                .into_iter()
                 .map(|(gram, offsets)| {
                     let gram_str = THE_ENCODING.decode(&gram).0.to_string();
                     let io_offsets = offsets
@@ -59,7 +61,8 @@ impl From<Index> for IOIndexResult {
                         })
                         .collect::<Vec<IOOffset>>();
                     (gram_str, io_offsets)
-                }).collect::<_>(),
+                })
+                .collect::<_>(),
         }
     }
 }
@@ -67,20 +70,24 @@ impl From<Index> for IOIndexResult {
 impl Into<Index> for IOIndexResult {
     fn into(self) -> Index {
         let mut tree = CompressedTree::new_empty();
-        
+
         // Reconstruct strings
         for (string_id, string) in self.strings {
             tree.soft_set_string(string_id, string).ok();
         }
-        
+
         // Reconstruct tree entries
         for (entry_id, io_entry) in self.tree {
-            tree.soft_set_tree_entry(entry_id, TreeEntry {
-                parent_index: io_entry.parent_id,
-                string_index: io_entry.string_id,
-            }).ok();
+            tree.soft_set_tree_entry(
+                entry_id,
+                TreeEntry {
+                    parent_index: io_entry.parent_id,
+                    string_index: io_entry.string_id,
+                },
+            )
+            .ok();
         }
-        
+
         // Reconstruct index map
         let mut map = IndexMap::new();
         for (gram_str, io_offsets) in self.index {
@@ -89,16 +96,19 @@ impl Into<Index> for IOIndexResult {
             if gram_bytes.len() == super::index::GRAM_SIZE {
                 let mut gram = [0u8; super::index::GRAM_SIZE];
                 gram.copy_from_slice(&gram_bytes[0..super::index::GRAM_SIZE]);
-                
+
                 for io_offset in io_offsets {
-                    map.insert(gram, Offset {
-                        file_id: io_offset.file_id,
-                        offset: io_offset.offset,
-                    });
+                    map.insert(
+                        gram,
+                        Offset {
+                            file_id: io_offset.file_id,
+                            offset: io_offset.offset,
+                        },
+                    );
                 }
             }
         }
-        
+
         Index { tree, map }
     }
 }
@@ -108,13 +118,10 @@ pub async fn write_index_result(
     out: &mut (impl AsyncWriteExt + std::marker::Unpin),
 ) -> Result<(), Error> {
     let io_index_result: IOIndexResult = index_result.into();
-    let bytes = serde_json::to_string(&io_index_result).map_err(|e| {
-        return Error::JsonError {
-            inner: e,
-            reason: "s5",
-        };
+    let bytes = postcard::to_stdvec(&io_index_result).map_err(|e| {
+        return Error::PostcardError;
     })?;
-    out.write_all(bytes.as_bytes()).await.map_err(|e| {
+    out.write_all(&bytes).await.map_err(|e| {
         return Error::CannotWrite { inner_err: e };
     })?;
     Ok(())
@@ -126,12 +133,9 @@ pub async fn read_index_result(mut input: Pin<&mut impl AsyncReadExt>) -> Result
         .read_to_end(&mut contents)
         .await
         .map_err(|e| Error::CannotRead { inner_err: e })?;
-    let str = String::from_utf8(contents).map_err(|e| Error::DecodeUtf8Error { error: e })?;
-    let io_index_result: IOIndexResult = serde_json::from_str(&str).map_err(|e| {
-        return Error::JsonError {
-            inner: e,
-            reason: "s6",
-        };
+    // let str = String::from_utf8(contents).map_err(|e| Error::DecodeUtf8Error { error: e })?;
+    let io_index_result: IOIndexResult = postcard::from_bytes(&contents).map_err(|e| {
+        return Error::PostcardError;
     })?;
     Ok(io_index_result.into())
 }

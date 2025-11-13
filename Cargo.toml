@@ -17,3 +17,4 @@ async-pool = "1.2.0"
 encoding_rs = "0.8.35"
 async-recursion = "1.1.1"
 num_cpus = "1.17.0"
+postcard = { version = "1", features = ["use-std"] }
