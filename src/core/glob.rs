@@ -30,7 +30,7 @@ pub struct TreeEntry {
 /// Key, index, id are the same thing here (sry for the confusion)
 mod compressed_tree {
     use super::*;
-    #[derive(Debug)]
+    #[derive(Debug, Clone)]
     pub struct CompressedTree {
         _strings: HashMap<usize, String>,
         _tree: HashMap<usize, TreeEntry>,

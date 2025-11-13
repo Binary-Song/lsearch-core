@@ -1,12 +1,17 @@
 use super::error::Error;
 use super::glob::{glob, CompressedTree, GlobArgs};
-use crate::core::io::write_index_result;
+use crate::core::io::{read_index_result, write_index_result};
 use crate::core::progress::Progress;
 pub use crate::prelude::*;
+use futures::stream::{self, StreamExt};
 pub use index_map::IndexMap;
+use itertools::Itertools;
+use std::arch::x86_64;
 use std::collections::HashMap;
 use std::path::Path;
+use std::pin::Pin;
 use std::sync::Arc;
+use tokio::sync::mpsc;
 use tokio::task::JoinSet;
 use tokio::{fs::File, io::AsyncReadExt};
 pub const GRAM_SIZE: usize = 4;
@@ -20,12 +25,14 @@ pub struct IndexArgs {
     pub read_chunk_size: usize,
     pub break_size: usize,
     pub channel_capacity: usize,
+    pub workers: usize,
     pub output_dir: String,
 }
 
 type FileId = usize;
 type FileOffset = usize;
 
+#[derive(Debug)]
 pub struct Offset {
     pub file_id: FileId,
     pub offset: FileOffset,
@@ -34,6 +41,7 @@ pub struct Offset {
 mod index_map {
     use super::*;
 
+    #[derive(Debug)]
     pub struct IndexMap {
         /// mapping from grams (little pieces of substrings) to list of offsets where it appears
         map: HashMap<Gram, Vec<Offset>>,
@@ -84,6 +92,15 @@ mod index_map {
 pub struct Index {
     pub map: IndexMap,
     pub tree: CompressedTree,
+}
+
+impl Index {
+    pub fn new() -> Self {
+        Index {
+            map: IndexMap::new(),
+            tree: CompressedTree::new_empty(),
+        }
+    }
 }
 
 /// Index a chunk of data by sliding a window over it.
@@ -213,23 +230,48 @@ pub async fn index_directory(
     // ----------------------------
     //            Glob
     // ----------------------------
-    let glob_args = GlobArgs {
-        target_dir: args1.target_dir,
-        includes: args1.includes,
-        excludes: args1.excludes,
+    let glob_cache_path = Path::new(&args1.output_dir).join("glob_cache.json");
+    let glob_cache_file = File::open(glob_cache_path).await;
+    let compressed_tree = match glob_cache_file {
+        Ok(mut glob_cache_file) => {
+            let r = read_index_result(Pin::new(&mut glob_cache_file)).await?;
+            r.tree
+        }
+        Err(_) => {
+            let glob_args = GlobArgs {
+                target_dir: args1.target_dir,
+                includes: args1.includes,
+                excludes: args1.excludes,
+            };
+            glob(&glob_args, sender.clone()).await?
+        }
     };
-    let compressed_tree = glob(&glob_args, sender.clone()).await?;
-    sender
-        .send(Progress::GlobDone)
-        .await;
-    
+
+    // write glob cache
+    let glob_cache_path = Path::new(&args.output_dir).join("glob_cache.json");
+    let mut glob_cache_file = File::create(glob_cache_path)
+        .await
+        .map_err(|e| Error::CannotWrite { inner_err: e })?;
+    write_index_result(
+        Index {
+            map: IndexMap::new(),
+            tree: compressed_tree.clone(),
+        },
+        &mut glob_cache_file,
+    )
+    .await?;
+    sender.send(Progress::GlobDone).await;
+
     // ----------------------------
     //      Task Creation
     // ----------------------------
     let glob = Arc::new(compressed_tree);
     let args: Arc<IndexArgs> = Arc::new(args);
+    let total_files_to_index = glob.get_tree_len();
     // for each file globbed, create a worker task to index it
-    let worker_tasks = glob
+    // Create channel for worker results
+    let (worker_sender, mut worker_recvr) = tokio::sync::mpsc::channel::<_>(args.channel_capacity);
+    let mut worker_tasks = glob
         .get_tree_iter()
         .enumerate()
         .map(|(file_index, _entry)| {
@@ -237,82 +279,145 @@ pub async fn index_directory(
             let file_index = file_index;
             let glob = glob.clone();
             let args = args.clone();
-            async move { index_file(glob.as_ref(), args.as_ref(), file_index).await }
+            let worker_sender = worker_sender.clone();
+            async move {
+                let r = index_file(glob.as_ref(), args.as_ref(), file_index).await;
+                worker_sender.send(r).await;
+            }
         });
-    let mut join_set = JoinSet::new();
-    for task in worker_tasks {
-        join_set.spawn(task);
-    }
 
-    let mut index_res = IndexMap::new();
-    let mut part_tree_res = CompressedTree::new_empty();
-    let mut indexed = 0;
-    let mut index_file = 0;
-    let total = glob.get_tree_len();
     // ----------------------------
     //          Task Awaiting
     // ----------------------------
     // keep awaiting any finished worker task
     // until all worker tasks are done
 
-    while let Some(worker_result) = join_set.join_next().await {
-        indexed += 1;
-        match worker_result {
-            Ok(Ok((index, part_tree))) => {
-                index_res.merge(index);
-                part_tree_res.merge(part_tree);
-                sender
-                    .send(Progress::IndexAdded {
-                        finished_entries: indexed,
-                        total_entries: total,
+    async fn consumer(
+        total_files_to_index: usize,
+        mut worker_recvr: tokio::sync::mpsc::Receiver<Result<(IndexMap, CompressedTree), Error>>,
+        global_sender: tokio::sync::mpsc::Sender<Progress>,
+        args: Arc<IndexArgs>,
+    ) -> Result<(), Error> {
+        let mut buffer_index = IndexMap::new();
+        let mut buffer_tree = CompressedTree::new_empty();
+        let mut files_indexed = 0;
+        let mut index_files_written = 0;
+        while let Some(worker_result) = worker_recvr.recv().await {
+            files_indexed += 1;
+            match worker_result {
+                Ok((index, tree)) => {
+                    buffer_index.merge(index);
+                    buffer_tree.merge(tree);
+                    global_sender
+                        .send(Progress::IndexAdded {
+                            finished_entries: files_indexed,
+                            total_entries: total_files_to_index,
+                        })
+                        .await;
+                }
+                Err(e) => {
+                    continue;
+                }
+            };
+
+            if buffer_index.estimated_size() >= args.break_size {
+                // Write buffer to file
+                let output_filename = format!("index_{}.json", index_files_written);
+                let output_path = Path::new(&args.output_dir).join(output_filename);
+                let mut output_file = File::create(output_path.clone())
+                    .await
+                    .map_err(|e| Error::CannotWrite { inner_err: e })?;
+                write_index_result(
+                    Index {
+                        map: buffer_index,
+                        tree: buffer_tree,
+                    },
+                    &mut output_file,
+                )
+                .await?;
+                global_sender
+                    .send(Progress::IndexWritten {
+                        output_path: output_path.clone(),
                     })
                     .await;
+                buffer_index = IndexMap::new();
+                buffer_tree = CompressedTree::new_empty();
+                index_files_written += 1;
             }
-            Ok(Err(e)) => {
-                continue;
-            }
-            Err(e) => {
-                return Err(Error::TaskDiedWithJoinError { inner: e });
-            }
-        };
-
-        if index_res.estimated_size() >= args.break_size {
-            let output_filename = format!("index_{}.json", index_file);
-            let output_path = Path::new(&args.output_dir).join(output_filename);
-            let mut output_file = File::create(output_path.clone())
-                .await
-                .map_err(|e| Error::CannotWrite { inner_err: e })?;
-            write_index_result(
-                Index {
-                    map: index_res,
-                    tree: part_tree_res,
-                },
-                &mut output_file,
-            )
-            .await?;
-            sender
-                .send(Progress::IndexWritten {
-                    output_path: output_path.clone(),
-                })
-                .await;
-            index_res = IndexMap::new();
-            part_tree_res = CompressedTree::new_empty();
-            index_file += 1;
         }
+
+        let output_filename = format!("index_{}.json", index_files_written);
+        let output_path = Path::new(&args.output_dir).join(output_filename);
+        let mut output_file = File::create(output_path.clone())
+            .await
+            .map_err(|e| Error::CannotWrite { inner_err: e })?;
+        write_index_result(
+            Index {
+                map: buffer_index,
+                tree: buffer_tree,
+            },
+            &mut output_file,
+        )
+        .await?;
+        global_sender
+            .send(Progress::IndexWritten {
+                output_path: output_path.clone(),
+            })
+            .await;
+        Ok(())
     }
 
-    let output_filename = format!("index_{}.json", index_file);
-    let output_path = Path::new(&args.output_dir).join(output_filename);
-    let mut output_file = File::create(output_path)
-        .await
-        .map_err(|e| Error::CannotWrite { inner_err: e })?;
-    write_index_result(
-        Index {
-            map: index_res,
-            tree: part_tree_res,
-        },
-        &mut output_file,
-    )
-    .await?;
+    let consumer = tokio::spawn(consumer(
+        total_files_to_index,
+        worker_recvr,
+        sender,
+        args.clone(),
+    ));
+
+    let mut join_set = JoinSet::new();
+    let mut count = 0;
+    loop {
+        match worker_tasks.next() {
+            Some(t) => {
+                join_set.spawn(t);
+                count += 1;
+            }
+            None => {
+                break {
+                    join_set.join_all();
+                }
+            }
+        }
+        if count >= args.workers {
+            // run the remaining task until done
+            break loop {
+                let join_result = join_set.join_next().await;
+                match join_result {
+                    // we got a finished task
+                    Some(task_res) =>
+                    // try to get another task to spawn
+                    {
+                        match worker_tasks.next() {
+                            // we have another task to spawn
+                            Some(t) => {
+                                // spawn
+                                join_set.spawn(t);
+                            }
+                            // we dont have any more tasks to spawn - keep draining
+                            None => {
+                                join_set.join_all();
+                                break;
+                            }
+                        }
+                    }
+                    // we have drained all tasks
+                    None => {
+                        break;
+                    }
+                }
+            };
+        }
+    }
+    consumer.await;
     return Ok(());
 }

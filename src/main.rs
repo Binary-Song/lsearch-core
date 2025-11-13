@@ -4,6 +4,7 @@ mod prelude;
 use crate::core::Error;
 use core::index_directory;
 use core::IndexArgs;
+use num_cpus;
 use serde::Deserialize;
 use serde::Serialize;
 use serde_json::Value;
@@ -37,6 +38,7 @@ struct IndexRequest {
     read_chunk_size: usize,
     channel_capacity: usize,
     break_size: usize,
+    workers: usize,
 }
 
 #[derive(Serialize)]
@@ -67,12 +69,13 @@ async fn handle_index_directory_request(
         read_chunk_size: args.read_chunk_size,
         channel_capacity: args.channel_capacity,
         output_dir: args.output_dir,
+        workers: args.workers,
         break_size: args.break_size,
     };
     let (send, mut recv) = tokio::sync::mpsc::channel(args.channel_capacity);
 
     // Spawn index_directory as a task so it runs concurrently with the message receiving loop
-    let index_task = tokio::spawn(async move { index_directory(args, send).await });
+    let index_task =  tokio::spawn(index_directory(args.clone(), send.clone()));
 
     while let Some(event) = recv.recv().await {
         let resp = match event {
@@ -108,11 +111,8 @@ async fn handle_index_directory_request(
     }
 
     // Wait for the indexing task to complete and return its result
-    match index_task.await {
-        Ok(Ok(_)) => Ok(()),
-        Ok(Err(e)) => Err(e),
-        Err(e) => Err(Error::TaskDiedWithJoinError { inner: e }),
-    }
+    index_task.await;
+    Ok(())
 }
 
 async fn handle_msg(msg: Value, out: Pin<&mut impl tokio::io::AsyncWrite>) -> Result<(), Error> {
@@ -181,9 +181,6 @@ mod test {
         println!("{:?}", dir);
         let test_res_dir = PathBuf::from(dir);
         let output_index_path = test_res_dir.join(".index");
-        if output_index_path.exists() {
-            std::fs::remove_dir_all(&output_index_path).unwrap();
-        }
         let result = handle_index_directory_request(
             IndexRequest {
                 target_dir: test_res_dir.to_str().unwrap().to_string(),
@@ -193,6 +190,7 @@ mod test {
                 channel_capacity: 16,
                 break_size: 1024 * 128 * 10,
                 output_dir: output_index_path.to_str().unwrap().to_string(),
+                workers: num_cpus::get(),
             },
             Pin::new(&mut tokio::io::stdout()),
         )
