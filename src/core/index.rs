@@ -135,14 +135,22 @@ async fn index_chunk(
     return Ok(());
 }
 
+enum IndexFileResult {
+    Ok(IndexMap, CompressedTree),
+    Skipped,
+}
+
 async fn index_file(
     glob: &CompressedTree,
     args: &IndexArgs,
     file_index: usize,
-) -> Result<(IndexMap, CompressedTree), Error> {
+) -> Result<IndexFileResult, Error> {
     let mut dep_tree = CompressedTree::new_empty();
     let path = glob.get_path_and_record_dependency(file_index, Some(&mut dep_tree))?;
     if !path.is_file() {
+        if path.is_dir() {
+            return Ok(IndexFileResult::Skipped);
+        }
         return Err(
             format!("Cannot index non-file path: {}", path.to_string_lossy())
                 .to_string()
@@ -170,7 +178,7 @@ async fn index_file(
 
         if bytes_read == 0 {
             // EOF
-            return Ok((result, dep_tree));
+            return Ok(IndexFileResult::Ok(result, dep_tree));
         }
         // now the chunk looks like this:
         // 0       padding_size       padding_size+bytes_read
@@ -273,7 +281,7 @@ struct IndexTaskProducer {
     current_index: usize,
     tree: Arc<CompressedTree>,
     args: Arc<IndexArgs>,
-    worker_sender: Sender<Result<(IndexMap, CompressedTree), Error>>,
+    worker_sender: Sender<Result<IndexFileResult, Error>>,
 }
 
 struct IndexTask {
@@ -336,7 +344,7 @@ async fn flush(
 
 async fn consumer(
     total_files_to_index: usize,
-    mut worker_recvr: Receiver<Result<(IndexMap, CompressedTree), Error>>,
+    mut worker_recvr: Receiver<Result<IndexFileResult, Error>>,
     sender: Sender<Progress>,
     args: Arc<IndexArgs>,
 ) -> Result<(), Error> {
@@ -349,7 +357,7 @@ async fn consumer(
     while let Some(worker_result) = worker_recvr.recv().await {
         files_indexed += 1;
         match worker_result {
-            Ok((index, tree)) => {
+            Ok(IndexFileResult::Ok(index, tree)) => {
                 buffer_index.merge(index);
                 buffer_tree.merge(tree);
                 sender
@@ -360,6 +368,7 @@ async fn consumer(
                     .await
                     .map_error(dbg_loc!())?;
             }
+            Ok(IndexFileResult::Skipped) => {}
             Err(e) => {
                 sender
                     .send(Progress::ErrorOccurred {
