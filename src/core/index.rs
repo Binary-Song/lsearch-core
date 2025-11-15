@@ -1,23 +1,19 @@
-use super::error::Error;
 use super::glob::{glob, CompressedTree, GlobArgs};
-use crate::core::error::MapError;
 use crate::core::io::{read_index_result, write_index_result};
 use crate::core::progress::Progress;
-pub use crate::prelude::*;
 use crate::prelude::*;
 use futures::stream::{self, StreamExt};
-pub use index_map::IndexMap;
-use itertools::Itertools;
-use std::arch::x86_64;
 use std::collections::HashMap;
+use std::fmt::format;
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
-use tokio::sync::mpsc::{self, channel, Receiver, Sender};
-use tokio::task::{JoinError, JoinSet};
+use tokio::sync::mpsc::{channel, Receiver, Sender};
+use tokio::task::JoinSet;
 use tokio::{fs::File, io::AsyncReadExt};
 
+pub use index_map::IndexMap;
 pub const GRAM_SIZE: usize = 4;
 pub type Gram = [u8; GRAM_SIZE];
 
@@ -30,6 +26,7 @@ pub struct IndexArgs {
     pub break_size: usize,
     pub channel_capacity: usize,
     pub workers: usize,
+    pub use_glob_cache: bool,
     pub output_dir: String,
 }
 
@@ -118,7 +115,7 @@ async fn index_chunk(
     chunk: &[u8],
     begin_offset: FileOffset,
     file_id: FileId,
-    args: &IndexArgs,
+    _args: &IndexArgs,
     res: &mut IndexMap,
 ) -> Result<(), Error> {
     if chunk.len() < GRAM_SIZE {
@@ -146,9 +143,11 @@ async fn index_file(
     let mut dep_tree = CompressedTree::new_empty();
     let path = glob.get_path_and_record_dependency(file_index, Some(&mut dep_tree))?;
     if !path.is_file() {
-        return Err("Cannot index a non-file path."
-            .to_string()
-            .into_error(dbg_loc!()));
+        return Err(
+            format!("Cannot index non-file path: {}", path.to_string_lossy())
+                .to_string()
+                .into_error(dbg_loc!()),
+        );
     }
     let file = File::open(&path).await;
     let mut file = file.map_error(dbg_loc!())?;
@@ -219,29 +218,42 @@ async fn execute_glob(
     sender: tokio::sync::mpsc::Sender<Progress>,
 ) -> Result<CompressedTree, Error> {
     let glob_cache_path = Path::new(&args.output_dir).join("glob_cache.json");
-    let glob_cache_file = File::open(glob_cache_path).await.map_error(dbg_loc!());
+    let glob_cache_file = File::open(glob_cache_path.clone())
+        .await
+        .map_error(dbg_loc!());
     // get the glob result by either reading from cache or globbing
-    let compressed_tree = match glob_cache_file {
-        Ok(mut glob_cache_file) => {
-            let index = read_index_result(Pin::new(&mut glob_cache_file))
-                .await
-                .map_error(dbg_loc!())?;
-            index.tree
-        }
-        Err(_) => {
-            let glob_args = GlobArgs {
-                target_dir: args.target_dir,
-                includes: args.includes,
-                excludes: args.excludes,
-            };
-            glob(&glob_args, sender.clone())
-                .await
-                .map_error(dbg_loc!())?
+    let compressed_tree = {
+        match (glob_cache_file, args.use_glob_cache) {
+            (Ok(mut glob_cache_file), true) => {
+                let index = read_index_result(Pin::new(&mut glob_cache_file))
+                    .await
+                    .map_error(dbg_loc!())?;
+                index.tree
+            }
+            _ => {
+                let glob_args = GlobArgs {
+                    target_dir: PathBuf::from(args.target_dir),
+                    includes: args.includes,
+                    excludes: args.excludes,
+                };
+                glob(&glob_args, sender.clone())
+                    .await
+                    .map_error(dbg_loc!())?
+            }
         }
     };
     // write glob cache
     let glob_cache_path = Path::new(&args.output_dir).join("glob_cache.json");
-    let mut glob_cache_file = File::create(glob_cache_path).await.map_error(dbg_loc!())?;
+    let mut glob_cache_file = File::create(glob_cache_path.clone())
+        .await
+        .map_err(|e| {
+            format!(
+                "Failed to create file {}: {}",
+                glob_cache_path.to_string_lossy(),
+                e
+            )
+        })
+        .map_error(dbg_loc!())?;
     write_index_result(
         Index {
             map: IndexMap::new(),
@@ -345,9 +357,16 @@ async fn consumer(
                         finished_entries: files_indexed,
                         total_entries: total_files_to_index,
                     })
-                    .await;
+                    .await
+                    .map_error(dbg_loc!())?;
             }
             Err(e) => {
+                sender
+                    .send(Progress::ErrorOccurred {
+                        message: format!("{e}"),
+                    })
+                    .await
+                    .map_error(dbg_loc!())?;
                 continue;
             }
         };
@@ -380,10 +399,44 @@ pub async fn index_directory(
     args: IndexArgs,
     sender: tokio::sync::mpsc::Sender<Progress>,
 ) -> Result<(), Error> {
-    // create output directory if it doesn't exist
-    tokio::fs::create_dir_all(&args.output_dir)
-        .await
-        .map_error(dbg_loc!())?;
+    let target_dir = PathBuf::from(args.target_dir.clone());
+    let output_dir = PathBuf::from(args.output_dir.clone());
+    if !target_dir.exists() {
+        return Err(format!(
+            "Target dir {} does not exist.",
+            target_dir.to_string_lossy()
+        )
+        .to_string()
+        .into_error(dbg_loc!()));
+    }
+    if !target_dir.is_dir() {
+        return Err(format!(
+            "Target dir {} is not a directory.",
+            target_dir.to_string_lossy()
+        )
+        .to_string()
+        .into_error(dbg_loc!()));
+    }
+    if !output_dir.exists() {
+        std::fs::create_dir(output_dir.clone())
+            .map_err(|e| {
+                format!(
+                    "Failed to create output directory {}: {}",
+                    output_dir.to_string_lossy(),
+                    e
+                )
+            })
+            .map_error(dbg_loc!())?;
+    } else {
+        if !target_dir.is_dir() {
+            return Err(format!(
+                "Output path {} is not a directory.",
+                target_dir.to_string_lossy()
+            )
+            .to_string()
+            .into_error(dbg_loc!()));
+        }
+    }
     // glob
     let compressed_tree = execute_glob(args.clone(), sender.clone()).await?;
     let compressed_tree: Arc<CompressedTree> = Arc::new(compressed_tree);
@@ -418,7 +471,8 @@ pub async fn index_directory(
                     .send(Progress::ErrorOccurred {
                         message: format!("{e:?}"),
                     })
-                    .await;
+                    .await
+                    .map_error(dbg_loc!())?;
             }
             Err(e) => {
                 sender
@@ -426,10 +480,14 @@ pub async fn index_directory(
                     .send(Progress::ErrorOccurred {
                         message: format!("{e:?}"),
                     })
-                    .await;
+                    .await
+                    .map_error(dbg_loc!())?;
             }
         }
     }
-    consumer.await.map_error(dbg_loc!())?;
+    consumer
+        .await
+        .map_error(dbg_loc!())?
+        .map_error(dbg_loc!())?;
     return Ok(());
 }

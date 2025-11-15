@@ -1,10 +1,4 @@
-use std::{
-    array::TryFromSliceError,
-    fmt::{Debug, Display},
-    io,
-};
-use tokio::sync::mpsc::error::TryRecvError;
-use tokio::{sync::mpsc::error::SendError, task::JoinError};
+use std::fmt::{Debug, Display};
 
 #[derive(Debug, Clone)]
 pub struct DebugLocation {
@@ -36,7 +30,13 @@ pub struct Error {
 
 impl Debug for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "Error(location: {}, {:?})", self.dbg_loc, self.inner)
+        write!(f, "Error({}, {:?})", self.dbg_loc, self.inner)
+    }
+}
+
+impl Display for Error {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Error({}, {:?})", self.dbg_loc, self.inner)
     }
 }
 

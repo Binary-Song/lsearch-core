@@ -10,8 +10,7 @@
             "name": "Debug unit tests in executable 'lsearch-core'",
             "cargo": {
                 "args": [
-                    "test",
-                    "index_dir_test",
+                    "r",
                 ]
             },
             "args": ["--no-capture"],

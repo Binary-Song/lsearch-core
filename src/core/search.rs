@@ -4,7 +4,6 @@ use crate::core::index::Gram;
 use crate::core::io::read_index_result;
 use crate::core::progress::Progress;
 use crate::prelude::*;
-use crate::prelude::*;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
@@ -151,10 +150,4 @@ pub async fn search_in_index_files(
 ) -> Result<(), Error> {
     // TODO: Implement searching across multiple index files
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::path::PathBuf;
 }

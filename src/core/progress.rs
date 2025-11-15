@@ -1,5 +1,6 @@
-use std::path::PathBuf;
+#[allow(unused_imports)]
 use crate::prelude::*;
+use std::path::PathBuf;
 #[derive(Debug)]
 pub enum Progress {
     GlobUpdated {

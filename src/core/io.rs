@@ -4,10 +4,12 @@ use super::{
     index::{Index, IndexMap, Offset},
 };
 use crate::prelude::*;
+use blake3::hash;
 use encoding_rs::WINDOWS_1252 as THE_ENCODING;
 use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, pin::Pin};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
 #[derive(Serialize, Deserialize, Debug)]
 struct IOTreeEntry {
     parent_id: usize,
@@ -117,18 +119,38 @@ pub async fn write_index_result(
     index_result: Index,
     out: &mut (impl AsyncWriteExt + std::marker::Unpin),
 ) -> Result<(), Error> {
+    // format: [32 bytes hash][data], 
+    // hash added just in case postcard goes rouge
     let io_index_result: IOIndexResult = index_result.into();
     let bytes = postcard::to_stdvec(&io_index_result).map_error(dbg_loc!())?;
+    let hash_value = hash(&bytes);
+    out.write_all(hash_value.as_bytes())
+        .await
+        .map_error(dbg_loc!())?;
     out.write_all(&bytes).await.map_error(dbg_loc!())?;
     Ok(())
 }
 
 pub async fn read_index_result(mut input: Pin<&mut impl AsyncReadExt>) -> Result<Index, Error> {
+    // format: [32 bytes hash][data]
     let mut contents = Vec::new();
     input
         .read_to_end(&mut contents)
         .await
         .map_error(dbg_loc!())?;
-    let io_index_result: IOIndexResult = postcard::from_bytes(&contents).map_error(dbg_loc!())?;
+    let (hash_bytes, data_bytes) = match contents.split_at_checked(32) {
+        Some(x) => x,
+        None => {
+            let x = Err("Data too short to contain hash"
+                .to_string()
+                .into_error(dbg_loc!()));
+            return x;
+        }
+    };
+    let computed_hash = hash(data_bytes);
+    if hash_bytes != computed_hash.as_bytes() {
+        return Err("Cache file corrupted.".to_string().into_error(dbg_loc!()));
+    }
+    let io_index_result: IOIndexResult = postcard::from_bytes(&data_bytes).map_error(dbg_loc!())?;
     Ok(io_index_result.into())
 }

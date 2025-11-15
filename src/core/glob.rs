@@ -9,10 +9,10 @@ use itertools::Itertools;
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use crate::prelude::*;
+
 #[derive(Debug)]
 pub struct GlobArgs {
-    pub target_dir: String,
+    pub target_dir: PathBuf,
     pub includes: Vec<String>,
     pub excludes: Vec<String>,
 }
@@ -40,7 +40,6 @@ mod compressed_tree {
     enum DupKeyAction {
         Error,
         CheckEqual,
-        Overwrite,
     }
     /// Adds kv pair to an internal hash map. Returns error if key already exists, the key if successful.
     /// - `key`: Optional key to use. If None, auto-increment `key_gen` to get a new key.
@@ -78,10 +77,6 @@ mod compressed_tree {
                     if *existing_val != val {
                         return id_to_err(key, should_gen_key).wrap_err();
                     }
-                    return Ok(key);
-                }
-                DupKeyAction::Overwrite => {
-                    *_occ_ent.get_mut() = val;
                     return Ok(key);
                 }
             },
@@ -349,13 +344,25 @@ async fn glob_dir_recursive(
     let entries = match fs::read_dir(dir_path) {
         Ok(entries) => entries,
         Err(e) => {
-            return Ok(()); // skip unreadable dirs
+            yielder
+                .send(Progress::ErrorOccurred {
+                    message: format!("{e}"),
+                })
+                .await
+                .map_error(dbg_loc!())?;
+            return Ok(());
         }
     };
     for entry in entries {
         let entry = match entry {
             Ok(e) => e,
             Err(e) => {
+                yielder
+                    .send(Progress::ErrorOccurred {
+                        message: format!("{e}"),
+                    })
+                    .await
+                    .map_error(dbg_loc!())?;
                 continue;
             }
         };
@@ -381,15 +388,16 @@ async fn glob_dir_recursive(
                 yielder,
                 result,
             )
-            .await;
+            .await?;
         } else if path.is_file() && inc_patts.is_match(&path) && !exc_patts.is_match(&path) {
-            add_to_compressed_tree(dir_index, &base_name, result);
+            add_to_compressed_tree(dir_index, &base_name, result)?;
             *report_counter += 1;
             yielder
                 .send(Progress::GlobUpdated {
                     entries: *report_counter,
                 })
-                .await;
+                .await
+                .map_error(dbg_loc!())?;
         }
     }
     return Ok(());
@@ -414,7 +422,15 @@ pub async fn glob(
             (inc_patts, exc_patts)
         }
     };
-    let mut compressed_tree = CompressedTree::new(args.target_dir.clone());
+    let target_dir = match args.target_dir.to_str() {
+        Some(s) => s,
+        None => {
+            return format!("Target dir path is not valid UTF-8: {:?}", args.target_dir)
+                .into_error(dbg_loc!())
+                .wrap_err();
+        }
+    };
+    let mut compressed_tree = CompressedTree::new(target_dir.to_string());
     glob_dir_recursive(
         args.target_dir.as_ref(),
         0,
@@ -424,6 +440,6 @@ pub async fn glob(
         &mut yielder,
         &mut compressed_tree,
     )
-    .await;
+    .await?;
     return Ok(compressed_tree);
 }

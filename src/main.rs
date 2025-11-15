@@ -15,8 +15,6 @@ use std::pin::Pin;
 use std::process::ExitCode;
 use tokio::io::AsyncBufReadExt;
 use tokio::io::AsyncWriteExt;
-use tokio::io::BufReader;
-use tokio::io::Stdout;
 
 #[derive(Deserialize)]
 #[serde(tag = "request_type", content = "request_data")]
@@ -41,6 +39,7 @@ struct IndexRequest {
     channel_capacity: usize,
     break_size: usize,
     workers: usize,
+    use_glob_cache: bool,
 }
 
 #[derive(Serialize)]
@@ -60,7 +59,6 @@ enum IndexResponse {
     ErrorOccurred {
         message: String,
     },
-    Finished,
 }
 
 async fn handle_index_directory_request(
@@ -76,12 +74,11 @@ async fn handle_index_directory_request(
         output_dir: args.output_dir,
         workers: args.workers,
         break_size: args.break_size,
+        use_glob_cache: args.use_glob_cache,
     };
     let (send, mut recv) = tokio::sync::mpsc::channel(args.channel_capacity);
-
     // Spawn index_directory as a task so it runs concurrently with the message receiving loop
-    let index_task = tokio::spawn(index_directory(args.clone(), send.clone()));
-
+    let index_task = tokio::spawn(index_directory(args.clone(), send));
     while let Some(event) = recv.recv().await {
         let resp = match event {
             core::Progress::GlobUpdated { entries } => IndexResponse::GlobUpdated { entries },
@@ -111,7 +108,7 @@ async fn handle_index_directory_request(
     }
 
     // Wait for the indexing task to complete and return its result
-    index_task.await;
+    index_task.await.map_error(dbg_loc!())?.map_error(dbg_loc!())?;
     Ok(())
 }
 
@@ -143,7 +140,8 @@ async fn main_loop(
 async fn main() -> ExitCode {
     use console_subscriber;
     console_subscriber::init();
-    let dir = "E:\\trash\\chromium-main\\";
+    let dir = "E:\\trash\\chromium-main2";
+    println!("Indexing directory: {}", dir);
     let test_res_dir = PathBuf::from(dir);
     let output_index_path = test_res_dir.join(".index");
     let result = handle_index_directory_request(
@@ -156,11 +154,18 @@ async fn main() -> ExitCode {
             break_size: 1024 * 1024 * 64,
             output_dir: output_index_path.to_str().unwrap().to_string(),
             workers: num_cpus::get(),
+            use_glob_cache: false,
         },
         Pin::new(&mut tokio::io::stdout()),
     )
     .await;
-    todo!()
+    match result {
+        Ok(_) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("Indexing failed with error: {:?}", e);
+            ExitCode::FAILURE
+        }
+    }
 
     // let stdin = tokio::io::stdin();
     // let stdin = BufReader::new(stdin);
@@ -189,6 +194,7 @@ mod test {
 
     #[tokio::test]
     async fn index_dir_test() {
+        console_subscriber::init();
         let dir = "E:\\trash\\chromium-main\\";
         let test_res_dir = PathBuf::from(dir);
         let output_index_path = test_res_dir.join(".index");
@@ -197,11 +203,12 @@ mod test {
                 target_dir: test_res_dir.to_str().unwrap().to_string(),
                 includes: vec!["*".to_string()],
                 excludes: vec!["*.ignoreme".to_string(), "*.index".to_string()],
-                read_chunk_size: 1024 * 512,
-                channel_capacity: 16,
-                break_size: 1024 * 1024 * 64,
+                read_chunk_size: 1024 * 1024,
+                channel_capacity: 256 * 1024,
+                break_size: 1024 * 1024 * 256,
                 output_dir: output_index_path.to_str().unwrap().to_string(),
                 workers: num_cpus::get(),
+                use_glob_cache: false,
             },
             Pin::new(&mut tokio::io::stdout()),
         )
