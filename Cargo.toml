@@ -4,18 +4,19 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+# When will you assholes go 1.0
 async-stream = "0.3.6"
 futures = "0.3.31"
 globset = "0.4.18"
 itertools = "0.14.0"
-tempfile = "3.23.0"
-tokio = { version = "1", features = ["full", "tracing"] }
 tokio-stream = "0.1.17"
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
-async-pool = "1.2.0"
 encoding_rs = "0.8.35"
-async-recursion = "1.1.1"
-num_cpus = "1.17.0"
-postcard = { version = "1", features = ["use-std"] }
-console-subscriber = "0.2"
+console-subscriber = "0.5.0"
+# Already 1.0, thank you!
+tokio = { version = "1.*", features = ["full", "tracing"] }
+serde = { version = "1.*", features = ["derive"] }
+async-pool = "1.*"
+async-recursion = "1.*"
+num_cpus = "1.*"
+postcard = { version = "1.*", features = ["use-std"] }
+serde_json = "1.*"
