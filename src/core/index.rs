@@ -470,7 +470,7 @@ pub async fn index_directory(
         .map(|index_task| tokio::spawn(index_task.task))
         .buffer_unordered(args.workers);
 
-    // send all the results
+    // stream the index tasks and send results
     while let Some(result) = result_iter.next().await {
         match result {
             Ok(Ok(())) => {}
@@ -498,5 +498,5 @@ pub async fn index_directory(
         .await
         .map_error(dbg_loc!())?
         .map_error(dbg_loc!())?;
-    return Ok(());
+    return Ok(());     
 }

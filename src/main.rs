@@ -1,220 +1,40 @@
 pub mod core;
+pub mod interfaces;
 mod prelude;
 
-use crate::core::Error;
-use crate::prelude::IntoError;
-use crate::prelude::MapError;
-use core::index_directory;
-use core::IndexArgs;
-use num_cpus;
-use serde::Deserialize;
-use serde::Serialize;
-use serde_json::Value;
-use std::path::PathBuf;
-use std::pin::Pin;
 use std::process::ExitCode;
-use tokio::io::AsyncBufReadExt;
-use tokio::io::AsyncWriteExt;
 
-#[derive(Deserialize)]
-#[serde(tag = "request_type", content = "request_data")]
-enum Request {
-    IndexDirectory(IndexRequest),
+use clap::Parser;
+use clap::Subcommand;
+use clap::ValueEnum;
+
+#[derive(Parser, Debug)]
+pub struct CommandLineArgs {
+    #[command(subcommand)]
+    pub mode: Mode,
+    #[arg(long)]
+    pub init_console_subscriber: bool,
 }
 
-#[derive(Serialize)]
-#[serde(tag = "response_type", content = "response_data")]
-enum Response {
-    IndexResponse(IndexResponse),
-    Error { message: String },
-}
-
-#[derive(Deserialize)]
-struct IndexRequest {
-    target_dir: String,
-    output_dir: String,
-    includes: Vec<String>,
-    excludes: Vec<String>,
-    read_chunk_size: usize,
-    channel_capacity: usize,
-    break_size: usize,
-    workers: usize,
-    use_glob_cache: bool,
-}
-
-#[derive(Serialize)]
-#[serde(tag = "type", content = "data")]
-enum IndexResponse {
-    GlobUpdated {
-        entries: usize,
+#[derive(Subcommand, Debug)]
+pub enum Mode {
+    Json {
+        #[arg(long, default_value = "127.0.0.1")]
+        host: String,
+        #[arg(long, default_value_t = 1114)]
+        port: u16,
     },
-    GlobDone,
-    IndexAdded {
-        finished_entries: usize,
-        total_entries: usize,
-    },
-    IndexWritten {
-        path: String,
-    },
-    ErrorOccurred {
-        message: String,
-    },
-}
-
-async fn handle_index_directory_request(
-    args: IndexRequest,
-    mut out: Pin<&mut impl tokio::io::AsyncWrite>,
-) -> Result<(), Error> {
-    let args = IndexArgs {
-        target_dir: args.target_dir,
-        includes: args.includes,
-        excludes: args.excludes,
-        read_chunk_size: args.read_chunk_size,
-        channel_capacity: args.channel_capacity,
-        output_dir: args.output_dir,
-        workers: args.workers,
-        break_size: args.break_size,
-        use_glob_cache: args.use_glob_cache,
-    };
-    let (send, mut recv) = tokio::sync::mpsc::channel(args.channel_capacity);
-    // Spawn index_directory as a task so it runs concurrently with the message receiving loop
-    let index_task = tokio::spawn(index_directory(args.clone(), send));
-    while let Some(event) = recv.recv().await {
-        let resp = match event {
-            core::Progress::GlobUpdated { entries } => IndexResponse::GlobUpdated { entries },
-            core::Progress::GlobDone => IndexResponse::GlobDone,
-            core::Progress::IndexAdded {
-                finished_entries,
-                total_entries,
-            } => IndexResponse::IndexAdded {
-                finished_entries,
-                total_entries,
-            },
-            core::Progress::IndexWritten { output_path } => IndexResponse::IndexWritten {
-                path: output_path.to_string_lossy().to_string(),
-            },
-            core::Progress::FileSearched { .. } => {
-                // This is for search progress, not index progress - skip it
-                continue;
-            }
-            core::Progress::ErrorOccurred { message } => IndexResponse::ErrorOccurred { message },
-        };
-        let v = serde_json::to_value(resp).map_error(dbg_loc!())?;
-        let line = serde_json::to_string(&v).map_error(dbg_loc!())? + "\n";
-        out.as_mut()
-            .write_all(line.as_bytes())
-            .await
-            .map_error(dbg_loc!())?;
-    }
-
-    // Wait for the indexing task to complete and return its result
-    index_task.await.map_error(dbg_loc!())?.map_error(dbg_loc!())?;
-    Ok(())
-}
-
-async fn handle_msg(msg: Value, out: Pin<&mut impl tokio::io::AsyncWrite>) -> Result<(), Error> {
-    let msg: Request = serde_json::from_value(msg).map_error(dbg_loc!())?;
-    match msg {
-        Request::IndexDirectory(args) => handle_index_directory_request(args, out).await,
-    }
-}
-
-async fn main_loop(
-    mut input: Pin<&mut impl tokio::io::AsyncBufRead>,
-    mut out: Pin<&mut impl tokio::io::AsyncWrite>,
-) -> Result<(), Error> {
-    let mut lines = input.as_mut().lines();
-    while let Some(line) = lines.next_line().await.map_error(dbg_loc!())? {
-        let serde_value = match serde_json::from_str::<Value>(&line) {
-            Ok(v) => v,
-            Err(e) => {
-                return Err(e.into_error(dbg_loc!()));
-            }
-        };
-        handle_msg(serde_value, out.as_mut()).await?;
-    }
-    return Ok(());
 }
 
 #[tokio::main]
 async fn main() -> ExitCode {
-    use console_subscriber;
-    console_subscriber::init();
-    let dir = "E:\\trash\\chromium-main2";
-    println!("Indexing directory: {}", dir);
-    let test_res_dir = PathBuf::from(dir);
-    let output_index_path = test_res_dir.join(".index");
-    let result = handle_index_directory_request(
-        IndexRequest {
-            target_dir: test_res_dir.to_str().unwrap().to_string(),
-            includes: vec!["*".to_string()],
-            excludes: vec!["*.ignoreme".to_string(), "*.index".to_string()],
-            read_chunk_size: 1024 * 512,
-            channel_capacity: 16,
-            break_size: 1024 * 1024 * 64,
-            output_dir: output_index_path.to_str().unwrap().to_string(),
-            workers: num_cpus::get(),
-            use_glob_cache: false,
-        },
-        Pin::new(&mut tokio::io::stdout()),
-    )
-    .await;
-    match result {
-        Ok(_) => ExitCode::SUCCESS,
-        Err(e) => {
-            eprintln!("Indexing failed with error: {:?}", e);
-            ExitCode::FAILURE
-        }
-    }
-
-    // let stdin = tokio::io::stdin();
-    // let stdin = BufReader::new(stdin);
-    // let stdout = tokio::io::stdout();
-    // let mut stdin = Box::pin(stdin);
-    // let mut stdout = Box::pin(stdout);
-    // let result = main_loop(stdin.as_mut(), stdout.as_mut()).await;
-    // match result {
-    //     Ok(_) => ExitCode::SUCCESS,
-    //     Err(e) => {
-    //         let s = serde_json::to_string(&Response::Error {
-    //             message: format!("{e:?}",),
-    //         })
-    //         .unwrap();
-    //         let b = s.as_bytes();
-    //         stdout.as_mut().write_all(b).await.ok();
-    //         ExitCode::FAILURE
-    //     }
-    // }
-}
-
-#[cfg(test)]
-mod test {
-    use crate::*;
-    use console_subscriber;
-
-    #[tokio::test]
-    async fn index_dir_test() {
-        console_subscriber::init();
-        let dir = "E:\\trash\\chromium-main\\";
-        let test_res_dir = PathBuf::from(dir);
-        let output_index_path = test_res_dir.join(".index");
-        let result = handle_index_directory_request(
-            IndexRequest {
-                target_dir: test_res_dir.to_str().unwrap().to_string(),
-                includes: vec!["*".to_string()],
-                excludes: vec!["*.ignoreme".to_string(), "*.index".to_string()],
-                read_chunk_size: 1024 * 1024,
-                channel_capacity: 256 * 1024,
-                break_size: 1024 * 1024 * 256,
-                output_dir: output_index_path.to_str().unwrap().to_string(),
-                workers: num_cpus::get(),
-                use_glob_cache: false,
-            },
-            Pin::new(&mut tokio::io::stdout()),
-        )
-        .await;
-        if let Err(e) = result {
-            panic!("Test failed with error: {:?}", e);
-        }
+    let args = CommandLineArgs::parse();
+    let ok = match &args.mode {
+        Mode::Json { .. } => interfaces::json_lines::entry_point(&args).await,
+    };
+    if ok {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
     }
 }

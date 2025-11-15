@@ -21,4 +21,5 @@ pub enum Progress {
     ErrorOccurred {
         message: String,
     },
+    Done,
 }
