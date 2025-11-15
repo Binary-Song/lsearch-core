@@ -1,5 +1,5 @@
 use super::error::Error;
-use crate::core::error::IntoError;
+use crate::core::error::{IntoError, MapError};
 use crate::core::progress::Progress;
 use crate::prelude::*;
 use async_recursion::async_recursion;
@@ -9,7 +9,7 @@ use itertools::Itertools;
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-
+use crate::prelude::*;
 #[derive(Debug)]
 pub struct GlobArgs {
     pub target_dir: String,
@@ -70,13 +70,13 @@ mod compressed_tree {
         match map.entry(key) {
             Entry::Occupied(mut _occ_ent) => match dup_key_action {
                 DupKeyAction::Error => {
-                    return id_to_err(key, should_gen_key).into_result();
+                    return id_to_err(key, should_gen_key).wrap_err();
                 }
                 DupKeyAction::CheckEqual => {
                     // check equality
                     let existing_val = _occ_ent.get();
                     if *existing_val != val {
-                        return id_to_err(key, should_gen_key).into_result();
+                        return id_to_err(key, should_gen_key).wrap_err();
                     }
                     return Ok(key);
                 }
@@ -117,6 +117,10 @@ mod compressed_tree {
                 },
             );
             c
+        }
+
+        pub fn get_tree_at(&self, index: usize) -> Option<TreeEntry> {
+            self._tree.get(&index).cloned()
         }
 
         pub fn get_tree_iter(&self) -> impl Iterator<Item = (&usize, &TreeEntry)> {
@@ -283,9 +287,7 @@ fn compile_patterns(strs: &Vec<String>) -> CompiledPatterns {
     let strs_to_patts = |patts: &Vec<String>| {
         patts
             .iter()
-            .map(|pattern_str| {
-                Glob::new(pattern_str).map_err(|e| e.into_error(dbg_loc!())(pattern_str.clone()))
-            })
+            .map(|pattern_str| Glob::new(pattern_str).map_error(dbg_loc!()))
             .partition_map(|res| match res {
                 Ok(pat) => itertools::Either::Left(pat),
                 Err(err) => itertools::Either::Right(err),
@@ -403,10 +405,10 @@ pub async fn glob(
         (CompiledPatterns::Err { errs: errs1 }, CompiledPatterns::Err { errs: errs2 }) => {
             let mut errs = errs1;
             errs.extend(errs2);
-            return Err(Error::InvalidPatterns { errs });
+            return errs.into_error(dbg_loc!()).wrap_err();
         }
         (CompiledPatterns::Err { errs }, _) | (_, CompiledPatterns::Err { errs }) => {
-            return Err(Error::InvalidPatterns { errs });
+            return errs.into_error(dbg_loc!()).wrap_err();
         }
         (CompiledPatterns::Ok { patts: inc_patts }, CompiledPatterns::Ok { patts: exc_patts }) => {
             (inc_patts, exc_patts)

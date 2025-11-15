@@ -4,11 +4,11 @@ use crate::core::index::Gram;
 use crate::core::io::read_index_result;
 use crate::core::progress::Progress;
 use crate::prelude::*;
+use crate::prelude::*;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use tokio::fs::File;
-
 #[derive(Debug, Clone)]
 pub struct SearchArgs {
     pub index_files: Vec<String>,
@@ -27,11 +27,7 @@ pub async fn search_in_index_file(
     _sender: tokio::sync::mpsc::Sender<Progress>,
 ) -> Result<Vec<SearchResult>, Error> {
     // Read the index file
-    let mut index_file = File::open(file).await.map_err(|e| Error::CannotOpen {
-        file_index: 0,
-        inner_err: e,
-    })?;
-
+    let mut index_file = File::open(file).await.map_error(dbg_loc!())?;
     let index_result = read_index_result(Pin::new(&mut index_file)).await?;
 
     // Perform the search
@@ -161,5 +157,4 @@ pub async fn search_in_index_files(
 mod tests {
     use super::*;
     use std::path::PathBuf;
- 
 }

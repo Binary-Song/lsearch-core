@@ -1,5 +1,5 @@
 use std::path::PathBuf;
-
+use crate::prelude::*;
 #[derive(Debug)]
 pub enum Progress {
     GlobUpdated {
@@ -16,5 +16,8 @@ pub enum Progress {
     FileSearched {
         finished_files: usize,
         total_files: usize,
-    }
+    },
+    ErrorOccurred {
+        message: String,
+    },
 }
