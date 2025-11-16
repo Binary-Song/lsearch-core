@@ -8,6 +8,7 @@ use tracing::debug;
 use std::path::PathBuf;
 use tokio::fs;
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
+use std::sync::Once;
 
 pub struct EndToEndTest {
     pub target_dir: String,
@@ -15,22 +16,26 @@ pub struct EndToEndTest {
     pub truth: Vec<SearchResult>,
 }
 
+static INIT: Once = Once::new();
+
 fn setup_logging() {
-    // console layer (for tokio-console)
-    let console_layer = console_subscriber::spawn();
+    INIT.call_once(|| {
+        // console layer (for tokio-console)
+        let console_layer = console_subscriber::spawn();
 
-    // stdout log layer
-    let fmt_layer = fmt::layer().with_target(false).with_line_number(true);
+        // stdout log layer
+        let fmt_layer = fmt::layer().with_target(false).with_line_number(true);
 
-    // enable turning logs on/off via RUST_LOG
-    let filter = EnvFilter::from_default_env().add_directive("debug".parse().unwrap()); // default to debug level
+        // enable turning logs on/off via RUST_LOG
+        let filter = EnvFilter::from_default_env().add_directive("debug".parse().unwrap()); // default to debug level
 
-    // build final subscriber
-    tracing_subscriber::registry()
-        .with(console_layer) // tokio-console data
-        .with(fmt_layer) // normal stdout logs
-        .with(filter) // controls log levels
-        .init();
+        // build final subscriber
+        tracing_subscriber::registry()
+            .with(console_layer) // tokio-console data
+            .with(fmt_layer) // normal stdout logs
+            .with(filter) // controls log levels
+            .init();
+    });
 }
 
 impl EndToEndTest {
@@ -88,7 +93,13 @@ impl EndToEndTest {
             sender,
         ));
         let _drain = tokio::spawn(async move { while let Some(_progress) = recvr.recv().await {} });
-        let search_result: Vec<SearchResult> = task.await.expect("").expect("");
-        assert_eq!(search_result, self.truth);
+        let mut search_result: Vec<SearchResult> = task.await.expect("").expect("");
+        
+        // Sort results by file_path for consistent comparison
+        search_result.sort_by(|a, b| a.file_path.cmp(&b.file_path));
+        let mut truth = self.truth.clone();
+        truth.sort_by(|a, b| a.file_path.cmp(&b.file_path));
+        
+        assert_eq!(search_result, truth);
     }
 }

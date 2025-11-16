@@ -1,4 +1,5 @@
 import sys
+import argparse
 
 def find_query_offsets(filename, query):
     """Find all byte offsets where query exists in the file."""
@@ -27,21 +28,21 @@ def find_query_offsets(filename, query):
     return offsets
 
 def main():
-    # Ask for filename
-    filename = input("Enter filename: ").strip()
+    parser = argparse.ArgumentParser(description='Find byte offsets of a query string in a file.')
+    parser.add_argument('filename', help='Path to the file to search')
+    parser.add_argument('query', help='Query string to search for')
     
-    # Ask for query
-    query = input("Enter query string: ").strip()
+    args = parser.parse_args()
     
     # Find offsets
-    offsets = find_query_offsets(filename, query)
+    offsets = find_query_offsets(args.filename, args.query)
     
     # Output results
     if offsets:
-        print(f"\nFound {len(offsets)} occurrence(s) of '{query}':")
-        print(f"  Offsets = {offsets}")
+        print(f"Found {len(offsets)} occurrence(s) of '{args.query}':")
+        print(f"Offsets = {offsets}")
     else:
-        print(f"\nQuery '{query}' not found in file.")
+        print(f"Query '{args.query}' not found in file.")
 
 if __name__ == "__main__":
     main()

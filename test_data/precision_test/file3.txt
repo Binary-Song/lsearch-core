@@ -1,0 +1,4 @@
+Programming languages: Rust, Python, JavaScript, C++, Go, Java, TypeScript.
+Rust is a systems programming language that runs blazingly fast.
+Python is great for scripting and data analysis.
+JavaScript powers the web with frameworks like React and Vue.
