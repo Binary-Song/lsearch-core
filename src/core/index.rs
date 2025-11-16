@@ -121,14 +121,23 @@ async fn index_chunk(
     if chunk.len() < GRAM_SIZE {
         return Ok(());
     }
+    let padding_size = GRAM_SIZE - 1;
     for i in 0..(chunk.len() - GRAM_SIZE + 1) {
         let gram = &chunk[i..i + GRAM_SIZE];
         // insert fileid and fileoffset into res
+        // Subtract padding_size from the offset to get the actual file position
+        // The first `padding_size` bytes in the chunk are padding from the previous chunk
+        let actual_offset = if i >= padding_size {
+            begin_offset + (i - padding_size)
+        } else {
+            // This gram includes padding bytes, so it starts before begin_offset
+            begin_offset.saturating_sub(padding_size - i)
+        };
         res.insert(
             gram.try_into().unwrap(),
             Offset {
                 file_id,
-                offset: begin_offset + i,
+                offset: actual_offset,
             },
         );
     }
