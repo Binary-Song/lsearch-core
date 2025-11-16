@@ -9,6 +9,7 @@ pub mod index;
 pub mod io;
 pub mod progress;
 pub mod search;
+pub mod path_utils;
 
 pub use error::Error;
 pub use index::index_directory;

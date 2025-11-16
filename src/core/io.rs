@@ -119,7 +119,7 @@ pub async fn write_index_result(
     index_result: Index,
     out: &mut (impl AsyncWriteExt + std::marker::Unpin),
 ) -> Result<(), Error> {
-    // format: [32 bytes hash][data], 
+    // format: [32 bytes hash][data],
     // hash added just in case postcard goes rouge
     let io_index_result: IOIndexResult = index_result.into();
     let bytes = postcard::to_stdvec(&io_index_result).map_error(dbg_loc!())?;
@@ -141,7 +141,7 @@ pub async fn read_index_result(mut input: Pin<&mut impl AsyncReadExt>) -> Result
     let (hash_bytes, data_bytes) = match contents.split_at_checked(32) {
         Some(x) => x,
         None => {
-            let x = Err("Data too short to contain hash"
+            let x = Err("Cache files invalid. Please regenerate."
                 .to_string()
                 .into_error(dbg_loc!()));
             return x;
@@ -149,7 +149,9 @@ pub async fn read_index_result(mut input: Pin<&mut impl AsyncReadExt>) -> Result
     };
     let computed_hash = hash(data_bytes);
     if hash_bytes != computed_hash.as_bytes() {
-        return Err("Cache file corrupted.".to_string().into_error(dbg_loc!()));
+        return Err("Cache files invalid. Please regenerate."
+            .to_string()
+            .into_error(dbg_loc!()));
     }
     let io_index_result: IOIndexResult = postcard::from_bytes(&data_bytes).map_error(dbg_loc!())?;
     Ok(io_index_result.into())

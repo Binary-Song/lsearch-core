@@ -1,14 +1,14 @@
-mod index_request;
-mod search_request;
+mod index;
+mod search;
 use crate::core::Error;
 use crate::dbg_loc;
 use crate::prelude::IntoError;
 use crate::prelude::MapError;
 use crate::CommandLineArgs;
 use crate::Mode;
-use index_request::*;
+use index::*;
 use num_cpus;
-use search_request::*;
+use search::*;
 use serde::Deserialize;
 use serde::Serialize;
 use serde_json::Value;
@@ -23,24 +23,24 @@ use tokio::net::TcpListener;
 #[derive(Deserialize)]
 #[serde(tag = "request_type", content = "request_data")]
 enum Request {
-    IndexDirectory(IndexRequest),
+    Index(IndexRequest),
     Search(SearchRequest),
 }
 
 #[derive(Serialize)]
 #[serde(tag = "response_type", content = "response_data")]
 enum Response {
-    Listening { host: String, port: u16 },
-    IndexResponse(IndexResponse),
-    SearchResponse(SearchResponse),
+    ServerStarted { host: String, port: u16 },
+    Index(IndexResponse),
+    Search(SearchResponse),
     Error { message: String },
 }
 
-async fn handle_msg(msg: Value, out: Pin<&mut impl tokio::io::AsyncWrite>) -> Result<(), Error> {
+async fn handle_request(msg: Value, out: Pin<&mut impl tokio::io::AsyncWrite>) -> Result<(), Error> {
     let msg: Request = serde_json::from_value(msg).map_error(dbg_loc!())?;
     match msg {
-        Request::IndexDirectory(args) => handle_index_directory_request(args, out).await,
-        Request::Search(args) => todo!(),
+        Request::Index(args) => handle_index_directory_request(args, out).await,
+        Request::Search(args) => handle_search_request(args, out).await,
     }
 }
 
@@ -56,19 +56,19 @@ async fn main_loop(
                 return Err(e.into_error(dbg_loc!()));
             }
         };
-        handle_msg(serde_value, out.as_mut()).await?;
+        handle_request(serde_value, out.as_mut()).await?;
     }
     return Ok(());
 }
 pub async fn start_tcp_server(args: &CommandLineArgs) -> Result<(), Error> {
     match &args.mode {
         Mode::Json { host, port } => {
-            // Start TCP Server and serve 1 connection
+            // Start TCP Server and serve only 1 client
             let listener = TcpListener::bind(format!("{}:{}", host, port))
                 .await
                 .map_error(dbg_loc!())?;
             let local_addr = listener.local_addr().map_error(dbg_loc!())?;
-            let resp = Response::Listening {
+            let resp = Response::ServerStarted {
                 host: local_addr.ip().to_string(),
                 port: local_addr.port(),
             };

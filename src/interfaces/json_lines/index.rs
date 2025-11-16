@@ -9,7 +9,7 @@ use serde::Serialize;
 use std::pin::Pin;
 use tokio::io::AsyncWriteExt;
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Default)]
 pub struct IndexRequest {
     pub target_dir: String,
     pub output_dir: String,
@@ -17,7 +17,7 @@ pub struct IndexRequest {
     pub excludes: Vec<String>,
     pub read_chunk_size: usize,
     pub channel_capacity: usize,
-    pub break_size: usize,
+    pub flush_threshold: usize,
     pub workers: usize,
     pub use_glob_cache: bool,
 }
@@ -54,13 +54,16 @@ pub async fn handle_index_directory_request(
         channel_capacity: args.channel_capacity,
         output_dir: args.output_dir,
         workers: args.workers,
-        break_size: args.break_size,
+        flush_threshold: args.flush_threshold,
         use_glob_cache: args.use_glob_cache,
     };
-    let (send, mut recv) = tokio::sync::mpsc::channel(args.channel_capacity);
+    let (sender, mut recvr) = tokio::sync::mpsc::channel(args.channel_capacity);
     // Spawn index_directory as a task so it runs concurrently with the message receiving loop
-    let index_task = tokio::spawn(index_directory(args.clone(), send));
-    while let Some(event) = recv.recv().await {
+    let index_task = tokio::spawn(index_directory(args.clone(), sender));
+    // !!  CAUTION: sender MUST be DROPPED after this point  !!
+    // !!  Otherwise the channel will not be closed and the  !!
+    // !!  recv loop below will DEADLOCK                     !!
+    while let Some(event) = recvr.recv().await {
         let resp = match event {
             Progress::GlobUpdated { entries } => IndexResponse::GlobUpdated { entries },
             Progress::GlobDone => IndexResponse::GlobDone,

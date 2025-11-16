@@ -1,19 +1,17 @@
 pub mod core;
 pub mod interfaces;
 mod prelude;
+#[cfg(test)]
+mod test;
 
 use std::process::ExitCode;
-
 use clap::Parser;
 use clap::Subcommand;
-use clap::ValueEnum;
 
 #[derive(Parser, Debug)]
 pub struct CommandLineArgs {
     #[command(subcommand)]
     pub mode: Mode,
-    #[arg(long)]
-    pub init_console_subscriber: bool,
 }
 
 #[derive(Subcommand, Debug)]
@@ -29,6 +27,9 @@ pub enum Mode {
 #[tokio::main]
 async fn main() -> ExitCode {
     let args = CommandLineArgs::parse();
+
+
+
     let ok = match &args.mode {
         Mode::Json { .. } => interfaces::json_lines::entry_point(&args).await,
     };

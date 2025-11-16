@@ -17,13 +17,13 @@ pub use index_map::IndexMap;
 pub const GRAM_SIZE: usize = 4;
 pub type Gram = [u8; GRAM_SIZE];
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct IndexArgs {
     pub target_dir: String,
     pub includes: Vec<String>,
     pub excludes: Vec<String>,
     pub read_chunk_size: usize,
-    pub break_size: usize,
+    pub flush_threshold: usize,
     pub channel_capacity: usize,
     pub workers: usize,
     pub use_glob_cache: bool,
@@ -135,6 +135,7 @@ async fn index_chunk(
     return Ok(());
 }
 
+#[derive(Debug)]
 enum IndexFileResult {
     Ok(IndexMap, CompressedTree),
     Skipped,
@@ -225,7 +226,7 @@ async fn execute_glob(
     args: IndexArgs,
     sender: tokio::sync::mpsc::Sender<Progress>,
 ) -> Result<CompressedTree, Error> {
-    let glob_cache_path = Path::new(&args.output_dir).join("glob_cache.json");
+    let glob_cache_path = Path::new(&args.output_dir).join("glob_cache.bin");
     let glob_cache_file = File::open(glob_cache_path.clone())
         .await
         .map_error(dbg_loc!());
@@ -251,7 +252,7 @@ async fn execute_glob(
         }
     };
     // write glob cache
-    let glob_cache_path = Path::new(&args.output_dir).join("glob_cache.json");
+    let glob_cache_path = Path::new(&args.output_dir).join("glob_cache.bin");
     let mut glob_cache_file = File::create(glob_cache_path.clone())
         .await
         .map_err(|e| {
@@ -319,7 +320,7 @@ async fn flush(
     sender: Sender<Progress>,
 ) -> Result<(), Error> {
     // Write buffer to file
-    let output_filename = format!("index_{}.json", file_index);
+    let output_filename = format!("index_{}.bin", file_index);
     let output_path = output_dir.join(output_filename);
     let mut output_file = File::create(output_path.clone())
         .await
@@ -348,6 +349,7 @@ async fn consumer(
     sender: Sender<Progress>,
     args: Arc<IndexArgs>,
 ) -> Result<(), Error> {
+    debug!("Consumer started");
     let mut buffer_index = IndexMap::new();
     let mut buffer_tree = CompressedTree::new_empty();
     let mut files_indexed = 0;
@@ -355,11 +357,13 @@ async fn consumer(
     let mut join_set = JoinSet::new();
     let output_dir = PathBuf::try_from(&args.output_dir).map_error(dbg_loc!())?;
     while let Some(worker_result) = worker_recvr.recv().await {
+        debug!("Consumer: Worker result received, ok = {:?}", worker_result.is_ok());
         files_indexed += 1;
         match worker_result {
             Ok(IndexFileResult::Ok(index, tree)) => {
                 buffer_index.merge(index);
                 buffer_tree.merge(tree);
+                debug!("Consumer: sending result");
                 sender
                     .send(Progress::IndexAdded {
                         finished_entries: files_indexed,
@@ -367,6 +371,7 @@ async fn consumer(
                     })
                     .await
                     .map_error(dbg_loc!())?;
+                debug!("Consumer: sending result done");
             }
             Ok(IndexFileResult::Skipped) => {}
             Err(e) => {
@@ -380,7 +385,7 @@ async fn consumer(
             }
         };
 
-        if buffer_index.estimated_size() >= args.break_size {
+        if buffer_index.estimated_size() >= args.flush_threshold {
             join_set.spawn(flush(
                 index_files_written,
                 buffer_index,
@@ -400,6 +405,7 @@ async fn consumer(
         output_dir.clone(),
         sender.clone(),
     ));
+    debug!("Consumer: Awaiting all flush tasks");
     join_set.join_all().await;
     Ok(())
 }
@@ -447,7 +453,9 @@ pub async fn index_directory(
         }
     }
     // glob
+    debug!("Glob directory: {}", &args.target_dir);
     let compressed_tree = execute_glob(args.clone(), sender.clone()).await?;
+    debug!("Glob complete, tree size: {}", compressed_tree.get_tree_len());
     let compressed_tree: Arc<CompressedTree> = Arc::new(compressed_tree);
     let args: Arc<IndexArgs> = Arc::new(args);
     let total_files_to_index = compressed_tree.get_tree_len();
@@ -457,7 +465,7 @@ pub async fn index_directory(
         current_index: 0,
         tree: compressed_tree.clone(),
         args: args.clone(),
-        worker_sender: worker_sender.clone(),
+        worker_sender: worker_sender,
     };
     let consumer = tokio::spawn(consumer(
         total_files_to_index,
@@ -470,8 +478,10 @@ pub async fn index_directory(
         .map(|index_task| tokio::spawn(index_task.task))
         .buffer_unordered(args.workers);
 
-    // stream the index tasks and send results
+    debug!("Awaiting indexing tasks");
+    // stream the index tasks and send results.
     while let Some(result) = result_iter.next().await {
+        debug!("Indexing task completed");
         match result {
             Ok(Ok(())) => {}
             Ok(Err(e)) => {
@@ -494,9 +504,12 @@ pub async fn index_directory(
             }
         }
     }
+    drop(result_iter);
+    debug!("Awaiting consumer");
     consumer
         .await
         .map_error(dbg_loc!())?
         .map_error(dbg_loc!())?;
-    return Ok(());     
+    debug!("Index directory complete");
+    return Ok(());
 }
