@@ -52,13 +52,13 @@ pub async fn handle_search_request(
             let path = entry.path();
             if path.is_file() {
                 if let Some(ext) = path.extension() {
-                    if ext == "index" {
+                    if ext == "bin" {
                         index_files.push(path);
                     }
                 }
             }
         }
-    } else if target_path.is_file() && target_path.extension().map_or(false, |e| e == "index") {
+    } else if target_path.is_file() && target_path.extension().map_or(false, |e| e == "bin") {
         index_files.push(target_path);
     } else {
         return Err(format!(

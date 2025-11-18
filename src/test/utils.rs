@@ -4,11 +4,11 @@ use crate::core::{
 };
 use console_subscriber;
 use futures::{Sink, SinkExt};
-use tracing::debug;
 use std::path::PathBuf;
-use tokio::fs;
-use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 use std::sync::Once;
+use tokio::fs;
+use tracing::debug;
+use tracing_subscriber::{field::debug, fmt, prelude::*, EnvFilter};
 
 pub struct EndToEndTest {
     pub target_dir: String,
@@ -56,18 +56,21 @@ impl EndToEndTest {
                 target_dir: self.target_dir.clone(),
                 includes: vec!["*".to_string()],
                 excludes: vec![],
-                read_chunk_size: 1024 * 1024,
-                flush_threshold: 10 * 1024 * 1024,
-                channel_capacity: 10,
+                read_chunk_size: 1024 * 1024 * 100,
+                flush_threshold: 1024 * 1024 * 1024 * 100,
+                channel_capacity: 320,
                 output_dir: index_output_dir.clone(),
-                workers: 4,
-                use_glob_cache: false,
+                workers: 32,
+                use_glob_cache: true,
             };
 
             let (sender, mut recvr) = tokio::sync::mpsc::channel(10);
             let task = tokio::spawn(index_directory(index_args, sender));
-            let _drain =
-                tokio::spawn(async move { while let Some(_progress) = recvr.recv().await {} });
+            let _drain = tokio::spawn(async move {
+                while let Some(progress) = recvr.recv().await {
+                    debug!("Received progress update {:?}", &progress)
+                }
+            });
             task.await.expect("").expect("");
         }
 
@@ -84,7 +87,7 @@ impl EndToEndTest {
         // 3. Search for the query
         let search_args = SearchArgs {
             index_files,
-            workers: 4,
+            workers: 32,
         };
         let (sender, mut recvr) = tokio::sync::mpsc::channel(10);
         let task = tokio::spawn(search_in_index_files(
@@ -92,14 +95,18 @@ impl EndToEndTest {
             self.query.clone().into_bytes(),
             sender,
         ));
-        let _drain = tokio::spawn(async move { while let Some(_progress) = recvr.recv().await {} });
+        let _drain = tokio::spawn(async move {
+            while let Some(progress) = recvr.recv().await {
+                debug!("Received progress update {:?}", &progress)
+            }
+        });
         let mut search_result: Vec<SearchResult> = task.await.expect("").expect("");
-        
+
         // Sort results by file_path for consistent comparison
         search_result.sort_by(|a, b| a.file_path.cmp(&b.file_path));
         let mut truth = self.truth.clone();
         truth.sort_by(|a, b| a.file_path.cmp(&b.file_path));
-        
+
         assert_eq!(search_result, truth);
     }
 }
