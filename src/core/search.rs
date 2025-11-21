@@ -1,5 +1,5 @@
 use super::error::Error;
-use super::index::Index;
+use super::index::{Index, StratificationMetadata};
 use crate::core::index::Gram;
 use crate::core::io::read_index_result;
 use crate::core::progress::Progress;
@@ -11,8 +11,119 @@ use tokio::fs::File;
 
 #[derive(Debug, Clone)]
 pub struct SearchArgs {
-    pub index_files: Vec<PathBuf>,
+    pub index_dir: PathBuf, // Changed from index_files to index_dir
     pub workers: usize,
+}
+
+/// Find relevant group directories for a query based on its grams
+async fn find_relevant_groups(
+    index_dir: &Path,
+    query: &[u8],
+) -> Result<Vec<usize>, Error> {
+    // Try to load stratification metadata
+    let stratification_path = index_dir.join("stratification.json");
+    
+    let stratification = if let Ok(content) = tokio::fs::read_to_string(&stratification_path).await {
+        serde_json::from_str::<StratificationMetadata>(&content).ok()
+    } else {
+        None
+    };
+    
+    let gram_size = 4;
+    if query.len() < gram_size {
+        // If no stratification or query too short, return all groups
+        return find_all_groups(index_dir).await;
+    }
+    
+    match stratification {
+        Some(strat) => {
+            // Extract grams from query
+            let mut relevant_groups = HashSet::new();
+            let mut i = 0;
+            while i + gram_size <= query.len() {
+                let gram: Gram = query[i..i + gram_size].try_into().map_error(dbg_loc!())?;
+                
+                // Find which group this gram belongs to
+                for (group_id, range) in strat.groups.iter().enumerate() {
+                    if range.contains(&gram) {
+                        relevant_groups.insert(group_id);
+                        break;
+                    }
+                }
+                
+                // Move to next gram (non-overlapping or adjusted for coverage)
+                if i + gram_size < query.len() && i + gram_size + gram_size > query.len() {
+                    i = query.len() - gram_size;
+                } else {
+                    i += gram_size;
+                }
+            }
+            
+            Ok(relevant_groups.into_iter().collect())
+        }
+        None => {
+            // No stratification, search all groups
+            find_all_groups(index_dir).await
+        }
+    }
+}
+
+/// Find all group directories in the index directory
+async fn find_all_groups(index_dir: &Path) -> Result<Vec<usize>, Error> {
+    let mut groups = Vec::new();
+    
+    let mut entries = tokio::fs::read_dir(index_dir).await.map_error(dbg_loc!())?;
+    while let Some(entry) = entries.next_entry().await.map_error(dbg_loc!())? {
+        let path = entry.path();
+        if path.is_dir() {
+            if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                if let Some(group_id_str) = name.strip_prefix("group_") {
+                    if let Ok(group_id) = group_id_str.parse::<usize>() {
+                        groups.push(group_id);
+                    }
+                }
+            }
+        }
+    }
+    
+    // If no groups found, assume old structure (single directory)
+    if groups.is_empty() {
+        groups.push(0);
+    }
+    
+    groups.sort();
+    Ok(groups)
+}
+
+/// Get all index files in specified groups
+async fn get_index_files_for_groups(
+    index_dir: &Path,
+    groups: &[usize],
+) -> Result<Vec<PathBuf>, Error> {
+    let mut index_files = Vec::new();
+    
+    for &group_id in groups {
+        let group_dir = if group_id == 0 && !index_dir.join("group_0").exists() {
+            // Old structure - files directly in index_dir
+            index_dir.to_path_buf()
+        } else {
+            index_dir.join(format!("group_{}", group_id))
+        };
+        
+        if !group_dir.exists() {
+            continue;
+        }
+        
+        let mut entries = tokio::fs::read_dir(&group_dir).await.map_error(dbg_loc!())?;
+        while let Some(entry) = entries.next_entry().await.map_error(dbg_loc!())? {
+            let path = entry.path();
+            if path.is_file() && path.extension().and_then(|s| s.to_str()) == Some("bin") {
+                index_files.push(path);
+            }
+        }
+    }
+    
+    Ok(index_files)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -165,11 +276,19 @@ pub async fn search_in_index_files(
 ) -> Result<Vec<SearchResult>, Error> {
     use tokio::task::JoinSet;
 
+    // Find relevant groups for this query
+    let relevant_groups = find_relevant_groups(&args.index_dir, &query).await?;
+    debug!("Searching in {} groups: {:?}", relevant_groups.len(), relevant_groups);
+    
+    // Get index files for these groups
+    let index_files = get_index_files_for_groups(&args.index_dir, &relevant_groups).await?;
+    debug!("Found {} index files to search", index_files.len());
+    
     let mut join_set = JoinSet::new();
-    let total_files = args.index_files.len();
+    let total_files = index_files.len();
 
     // Spawn search tasks for each index file
-    for index_file in args.index_files {
+    for index_file in index_files {
         let query = query.to_vec();
         let sender = sender.clone();
         join_set.spawn(async move {

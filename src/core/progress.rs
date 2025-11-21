@@ -7,6 +7,7 @@ pub enum Progress {
         entries: usize,
     },
     GlobDone,
+    StratificationDone,
     IndexAdded {
         finished_entries: usize,
         total_entries: usize,

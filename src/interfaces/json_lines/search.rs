@@ -37,43 +37,18 @@ pub async fn handle_search_request(
     args: SearchRequest,
     mut out: Pin<&mut impl tokio::io::AsyncWrite>,
 ) -> Result<(), Error> {
-    // Find all .index files in target_dir
-    let target_path = PathBuf::from(&args.target_dir);
-    if !target_path.exists() {
-        return Err(format!("Target dir {} does not exist", args.target_dir).into_error(dbg_loc!()));
+    // The target_dir is now the index directory (not the directory being searched)
+    let index_dir = PathBuf::from(&args.target_dir);
+    if !index_dir.exists() {
+        return Err(format!("Index dir {} does not exist", args.target_dir).into_error(dbg_loc!()));
     }
 
-    let mut index_files = Vec::new();
-    if target_path.is_dir() {
-        let mut entries = tokio::fs::read_dir(&target_path)
-            .await
-            .map_error(dbg_loc!())?;
-        while let Some(entry) = entries.next_entry().await.map_error(dbg_loc!())? {
-            let path = entry.path();
-            if path.is_file() {
-                if let Some(ext) = path.extension() {
-                    if ext == "bin" {
-                        index_files.push(path);
-                    }
-                }
-            }
-        }
-    } else if target_path.is_file() && target_path.extension().map_or(false, |e| e == "bin") {
-        index_files.push(target_path);
-    } else {
-        return Err(format!(
-            "Target {} is not a directory or .index file",
-            args.target_dir
-        )
-        .into_error(dbg_loc!()));
-    }
-
-    if index_files.is_empty() {
-        return Err(format!("No .index files found in {}", args.target_dir).into_error(dbg_loc!()));
+    if !index_dir.is_dir() {
+        return Err(format!("Target {} is not a directory", args.target_dir).into_error(dbg_loc!()));
     }
 
     let search_args = SearchArgs {
-        index_files,
+        index_dir,
         workers: args.workers,
     };
 
@@ -82,7 +57,7 @@ pub async fn handle_search_request(
 
     // Spawn search task
     let search_task =
-        tokio::spawn(async move { search_in_index_files(search_args,  query, sender).await });
+        tokio::spawn(async move { search_in_index_files(search_args, query, sender).await });
 
     // Stream progress events
     while let Some(event) = recvr.recv().await {

@@ -20,6 +20,8 @@ pub struct IndexRequest {
     pub flush_threshold: usize,
     pub workers: usize,
     pub use_glob_cache: bool,
+    pub num_groups: Option<usize>, // Optional: number of gram groups for stratification
+    pub sampling_rate: Option<f64>, // Optional: sampling rate (e.g., 0.01 for 1%)
 }
 
 #[derive(Serialize)]
@@ -56,6 +58,8 @@ pub async fn handle_index_directory_request(
         workers: args.workers,
         flush_threshold: args.flush_threshold,
         use_glob_cache: args.use_glob_cache,
+        num_groups: args.num_groups.unwrap_or(1), // Default to 1 group (no stratification)
+        sampling_rate: args.sampling_rate.unwrap_or(0.01), // Default to 1% sampling
     };
     let (sender, mut recvr) = tokio::sync::mpsc::channel(args.channel_capacity);
     // Spawn index_directory as a task so it runs concurrently with the message receiving loop
@@ -67,6 +71,7 @@ pub async fn handle_index_directory_request(
         let resp = match event {
             Progress::GlobUpdated { entries } => IndexResponse::GlobUpdated { entries },
             Progress::GlobDone => IndexResponse::GlobDone,
+            Progress::StratificationDone => continue, // Skip stratification progress in JSON output
             Progress::IndexAdded {
                 finished_entries,
                 total_entries,

@@ -62,7 +62,9 @@ impl EndToEndTest {
                 output_dir: index_output_dir.clone(),
                 workers: 32,
                 use_glob_cache: true,
-            };
+                num_groups: 128, // Use 4 groups for testing stratification
+                sampling_rate: 0.01, // 1% sampling
+            }; 
 
             let (sender, mut recvr) = tokio::sync::mpsc::channel(10);
             let task = tokio::spawn(index_directory(index_args, sender));
@@ -74,19 +76,9 @@ impl EndToEndTest {
             task.await.expect("").expect("");
         }
 
-        // 2. Find all index files in output_dir
-        let mut index_files = Vec::new();
-        let mut entries = fs::read_dir(&index_output_dir).await.unwrap();
-        while let Some(entry) = entries.next_entry().await.unwrap() {
-            let path = entry.path();
-            if path.is_file() {
-                index_files.push(path);
-            }
-        }
-
-        // 3. Search for the query
+        // 2. Search using the index directory
         let search_args = SearchArgs {
-            index_files,
+            index_dir: PathBuf::from(&index_output_dir),
             workers: 32,
         };
         let (sender, mut recvr) = tokio::sync::mpsc::channel(10);

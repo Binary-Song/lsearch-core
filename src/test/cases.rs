@@ -75,3 +75,18 @@ async fn precision5_long_word() {
     };
     test.execute().await;
 }
+
+
+// #[tokio::test]
+// async fn precision6_long_word() {
+//     // Test searching for "JavaScript" - a longer word
+//     let test = EndToEndTest {
+//         target_dir: "E:\\trash\\chromium-main".to_string(),
+//         query: "windows".to_string(),
+//         truth: vec![SearchResult {
+//             file_path: PathBuf::from(".").normalize(),
+//             offsets: vec![1],
+//         }],
+//     };
+//     test.execute().await;
+// }
